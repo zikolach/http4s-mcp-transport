@@ -1,0 +1,75 @@
+name: Publish Maven Central
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish, for example 0.1.0 or 0.1.0-SNAPSHOT'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish-maven-central:
+    name: Publish to Maven Central
+    runs-on: ubuntu-latest
+
+    env:
+      SONATYPE_USERNAME: ${{ secrets.MILL_SONATYPE_USERNAME }}
+      SONATYPE_PASSWORD: ${{ secrets.MILL_SONATYPE_PASSWORD }}
+      PGP_SECRET: ${{ secrets.MILL_PGP_SECRET_BASE64 }}
+      PGP_PASSPHRASE: ${{ secrets.MILL_PGP_PASSPHRASE }}
+      HTTP4S_MCP_TRANSPORT_VERSION: ${{ inputs.version }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up sbt
+        uses: sbt/setup-sbt@v1
+
+      - name: Cache Scala and sbt dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/coursier
+            ~/.ivy2/cache
+            ~/.sbt
+          key: ${{ runner.os }}-sbt-${{ hashFiles('build.sbt', 'project/build.properties', 'project/plugins.sbt', '.scalafmt.conf') }}
+          restore-keys: |
+            ${{ runner.os }}-sbt-
+
+      - name: Validate build
+        run: sbt "scalafmtCheckAll; +compile; +transport / Test / testOnly io.github.http4smcp.Http4sStreamableServerTransportProviderSuite; simpleServer/compile"
+
+      - name: Publish packages to Maven Central
+        run: |
+          set -euo pipefail
+          version="${HTTP4S_MCP_TRANSPORT_VERSION:-}"
+          if [ -z "$version" ] && [ "${GITHUB_REF_NAME#v}" != "$GITHUB_REF_NAME" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -z "$version" ]; then
+            echo "Version is required. Use a v* tag or workflow_dispatch input." >&2
+            exit 2
+          fi
+
+          echo "Publishing http4s-mcp-transport ${version} to Maven Central"
+          if [[ "$version" == *-SNAPSHOT ]]; then
+            HTTP4S_MCP_TRANSPORT_VERSION="$version" sbt "+publishSigned"
+          else
+            HTTP4S_MCP_TRANSPORT_VERSION="$version" GITHUB_REF="refs/tags/v${version}" CI_RELEASE="+publishSigned" sbt ci-release
+          fi

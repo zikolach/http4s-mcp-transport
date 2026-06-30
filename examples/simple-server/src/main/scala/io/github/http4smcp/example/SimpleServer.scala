@@ -11,8 +11,6 @@ import io.modelcontextprotocol.spec.McpSchema
 import org.http4s.ember.server.EmberServerBuilder
 import org.http4s.syntax.all._
 
-import java.util.function.BiFunction
-
 object SimpleServer extends IOApp.Simple {
   override val run: IO[Unit] = {
     val provider = Http4sStreamableServerTransportProvider()
@@ -36,17 +34,12 @@ object SimpleServer extends IOApp.Simple {
           )
           .description("Echoes the provided message.")
           .build(),
-        new BiFunction[McpSyncServerExchange, McpSchema.CallToolRequest, McpSchema.CallToolResult] {
-          override def apply(
-              exchange: McpSyncServerExchange,
-              request: McpSchema.CallToolRequest
-          ): McpSchema.CallToolResult = {
-            val message = Option(request.arguments())
-              .flatMap(args => Option(args.get("message")))
-              .map(_.toString)
-              .getOrElse("")
-            McpSchema.CallToolResult.builder().addTextContent(message).build()
-          }
+        (_: McpSyncServerExchange, request: McpSchema.CallToolRequest) => {
+          val message = Option(request.arguments())
+            .flatMap(args => Option(args.get("message")))
+            .map(_.toString)
+            .getOrElse("")
+          McpSchema.CallToolResult.builder().addTextContent(message).build()
         }
       )
       .build()

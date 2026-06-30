@@ -24,6 +24,7 @@ import org.http4s.syntax.all._
 import org.typelevel.ci.CIString
 import reactor.core.publisher.Flux
 import reactor.core.publisher.Mono
+import reactor.core.publisher.Sinks
 
 import java.time.Duration
 import java.util.UUID
@@ -149,24 +150,22 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
 
   test("GET with Last-Event-ID asks the SDK session to replay before live stream") {
     for {
-      replayed <- Ref.of[IO, Option[String]](None)
-      gate     <- Semaphore[IO](0)
-      provider <- testProvider(replayObserver =
-        Some(id => replayed.set(Some(id.toString)) >> gate.release)
-      )
+      replayed  <- Ref.of[IO, Option[String]](None)
+      provider  <- testProvider(replayObserver = Some(id => replayed.set(Some(id.toString))))
       sessionId <- initialize(provider)
       response  <- provider.routes.orNotFound.run(
         get(Some(sessionId)).putHeaders(Header.Raw(CIString(HttpHeaders.LAST_EVENT_ID), "last-1"))
       )
-      read <- response.bodyText.interruptAfter(1.second).compile.string.start
-      _    <- gate.acquire.timeout(1.second)
-      _    <- IO.sleep(100.millis)
-      _    <- ReactorInterop.monoToIO(
+      bodyRef <- Ref.of[IO, String]("")
+      read    <- response.bodyText.evalMap(chunk => bodyRef.update(_ + chunk)).compile.drain.start
+      _       <- waitForBody(bodyRef, "replayed")
+      _       <- ReactorInterop.monoToIO(
         provider.notifyClient(sessionId, "after-replay", java.util.Map.of("ok", "true"))
       )
-      _    <- IO.sleep(100.millis)
+      _    <- waitForBody(bodyRef, "after-replay")
       _    <- ReactorInterop.monoToIO(provider.closeGracefully())
-      body <- read.joinWithNever
+      _    <- read.cancel
+      body <- bodyRef.get
       seen <- replayed.get
     } yield {
       assertEquals(response.status, Status.Ok)
@@ -177,27 +176,35 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
     }
   }
 
-  test("GET attaches live stream only after delayed replay completes") {
+  test("GET attaches live stream only after replay completes") {
     for {
-      provider  <- testProvider(replayDelay = Some(java.time.Duration.ofMillis(200)))
+      replayStarted <- Semaphore[IO](0)
+      replayRelease <- IO(Sinks.empty[Void]())
+      provider      <- testProvider(
+        replayObserver = Some(_ => replayStarted.release),
+        replayGate = Some(replayRelease.asMono())
+      )
       sessionId <- initialize(provider)
       response  <- provider.routes.orNotFound.run(
         get(Some(sessionId)).putHeaders(
           Header.Raw(CIString(HttpHeaders.LAST_EVENT_ID), "last-delayed")
         )
       )
-      read <- response.bodyText.interruptAfter(1.second).compile.string.start
-      _    <- IO.sleep(50.millis)
-      _    <- ReactorInterop
+      bodyRef <- Ref.of[IO, String]("")
+      read    <- response.bodyText.evalMap(chunk => bodyRef.update(_ + chunk)).compile.drain.start
+      _       <- replayStarted.acquire.timeout(1.second)
+      _       <- ReactorInterop
         .monoToIO(provider.notifyClient(sessionId, "during-replay", java.util.Map.of("ok", "true")))
         .attempt
-      _ <- IO.sleep(500.millis)
+      _ <- IO(replayRelease.tryEmitEmpty()).void
+      _ <- waitForBody(bodyRef, "replayed")
       _ <- ReactorInterop.monoToIO(
         provider.notifyClient(sessionId, "after-replay", java.util.Map.of("ok", "true"))
       )
-      _    <- IO.sleep(100.millis)
+      _    <- waitForBody(bodyRef, "after-replay")
       _    <- ReactorInterop.monoToIO(provider.closeGracefully())
-      body <- read.joinWithNever
+      _    <- read.cancel
+      body <- bodyRef.get
     } yield {
       assertEquals(response.status, Status.Ok)
       assert(body.contains("replayed"))
@@ -321,9 +328,8 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
       mono = Mono.never[Void]().doOnCancel(() => canceled.set(true).unsafeRunAndForget())
       fiber <- ReactorInterop.monoToIO(mono).start
       _     <- fiber.cancel
-      _     <- IO.sleep(100.millis)
-      value <- canceled.get
-    } yield assert(value)
+      _     <- waitForTrue(canceled)
+    } yield ()
   }
 
   test("IO fiber is canceled when Reactor subscriber disposes") {
@@ -332,22 +338,37 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
       mono = ReactorInterop.ioUnitToMono(IO.never.onCancel(canceled.set(true)))
       disposable <- IO(mono.subscribe())
       _          <- IO(disposable.dispose())
-      _          <- IO.sleep(100.millis)
-      value      <- canceled.get
-    } yield assert(value)
+      _          <- waitForTrue(canceled)
+    } yield ()
   }
+
+  private def waitForTrue(valueRef: Ref[IO, Boolean]): IO[Unit] =
+    valueRef.get
+      .flatMap { value =>
+        if (value) IO.unit
+        else IO.sleep(25.millis) >> waitForTrue(valueRef)
+      }
+      .timeout(2.seconds)
+
+  private def waitForBody(bodyRef: Ref[IO, String], text: String): IO[Unit] =
+    bodyRef.get
+      .flatMap { body =>
+        if (body.contains(text)) IO.unit
+        else IO.sleep(25.millis) >> waitForBody(bodyRef, text)
+      }
+      .timeout(2.seconds)
 
   private def testProvider(
       notificationHandler: Option[McpTransportContext => IO[Unit]] = None,
       replayObserver: Option[AnyRef => IO[Unit]] = None,
-      replayDelay: Option[java.time.Duration] = None,
+      replayGate: Option[Mono[Void]] = None,
       config: Http4sStreamableServerTransportProviderConfig =
         Http4sStreamableServerTransportProviderConfig()
   ): IO[Http4sStreamableServerTransportProvider] =
     IO {
       val provider = Http4sStreamableServerTransportProvider(jsonMapper = mapper, config = config)
       provider.setSessionFactory(
-        new TestSessionFactory(notificationHandler, replayObserver, replayDelay)
+        new TestSessionFactory(notificationHandler, replayObserver, replayGate)
       )
       provider
     }
@@ -387,7 +408,7 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
   private final class TestSessionFactory(
       notificationHandler: Option[McpTransportContext => IO[Unit]],
       replayObserver: Option[AnyRef => IO[Unit]],
-      replayDelay: Option[java.time.Duration]
+      replayGate: Option[Mono[Void]]
   ) extends McpStreamableServerSession.Factory {
     override def startSession(
         initializeRequest: McpSchema.InitializeRequest
@@ -414,7 +435,7 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
         requestHandlers,
         notificationHandlers,
         replayObserver,
-        replayDelay
+        replayGate
       )
       val result = McpSchema.InitializeResult
         .builder(
@@ -434,7 +455,7 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
       requestHandlers: java.util.Map[String, McpRequestHandler[_]],
       notificationHandlers: java.util.Map[String, McpNotificationHandler],
       replayObserver: Option[AnyRef => IO[Unit]],
-      replayDelay: Option[java.time.Duration]
+      replayGate: Option[Mono[Void]]
   ) extends McpStreamableServerSession(
         id,
         capabilities,
@@ -452,7 +473,7 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
           java.util.Map.of("id", lastEventId)
         ): McpSchema.JSONRPCMessage
       )
-      replayDelay.fold(messages)(messages.delayElements)
+      replayGate.fold(messages)(_.thenMany(messages))
     }
   }
 }

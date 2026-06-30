@@ -41,14 +41,18 @@ Mount `routes` into an existing http4s server. The core transport does not start
 Run all supported Scala versions:
 
 ```bash
-sbt +compile +test simpleServer/compile
+sbt "+compile; +transport / Test / testOnly io.github.http4smcp.Http4sStreamableServerTransportProviderSuite; simpleServer/compile"
 ```
 
 Check formatting:
 
 ```bash
-sbt scalafmtCheckAll
+sbt "scalafmtCheckAll"
 ```
+
+## Publishing
+
+Publishing to Maven Central is configured through GitHub Actions and sbt-ci-release. See `docs/publishing.md`.
 
 ## License
 

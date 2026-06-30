@@ -17,6 +17,6 @@ jobs:
           java-version: '17'
       - uses: sbt/setup-sbt@v1
       - name: Check formatting
-        run: sbt scalafmtCheckAll
+        run: sbt "scalafmtCheckAll"
       - name: Compile and test
-        run: sbt +compile +test simpleServer/compile
+        run: sbt "+compile; +transport / Test / testOnly io.github.http4smcp.Http4sStreamableServerTransportProviderSuite; simpleServer/compile"

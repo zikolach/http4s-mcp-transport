@@ -17,7 +17,6 @@ import io.modelcontextprotocol.spec.McpStreamableServerTransportProvider
 import io.modelcontextprotocol.util.KeepAliveScheduler
 import org.http4s.CacheDirective
 import org.http4s.Header
-import org.http4s.Headers
 import org.http4s.HttpRoutes
 import org.http4s.MediaType
 import org.http4s.Method
@@ -135,7 +134,7 @@ final class Http4sStreamableServerTransportProvider(
           jsonMapper.convertValue(jsonrpcRequest.params(), initializeRequestType)
         )
         init       <- IO.blocking(sessionFactory.startSession(initializeRequest))
-        _          <- IO.blocking(sessions.put(init.session().getId(), init.session())).void
+        _          <- IO.blocking(sessions.put(init.session().getId, init.session())).void
         initResult <- ReactorInterop.monoToIO(
           init.initResult().contextWrite(ctx => ctx.put(McpTransportContext.KEY, transportContext))
         )
@@ -146,7 +145,7 @@ final class Http4sStreamableServerTransportProvider(
           )
         )
         response <- Ok(body, `Content-Type`(MediaType.application.json)).map(
-          _.putHeaders(Header.Raw(CIString(HttpHeaders.MCP_SESSION_ID), init.session().getId()))
+          _.putHeaders(Header.Raw(CIString(HttpHeaders.MCP_SESSION_ID), init.session().getId))
         )
       } yield response
     }
@@ -352,14 +351,14 @@ final class Http4sStreamableServerTransportProvider(
 
 object Http4sStreamableServerTransportProvider {
   def apply(
-      jsonMapper: McpJsonMapper = McpJsonDefaults.getMapper(),
+      jsonMapper: McpJsonMapper = McpJsonDefaults.getMapper,
       config: Http4sStreamableServerTransportProviderConfig =
         Http4sStreamableServerTransportProviderConfig()
   )(implicit runtime: IORuntime): Http4sStreamableServerTransportProvider =
     new Http4sStreamableServerTransportProvider(jsonMapper, config)
 
   def routes(
-      jsonMapper: McpJsonMapper = McpJsonDefaults.getMapper(),
+      jsonMapper: McpJsonMapper = McpJsonDefaults.getMapper,
       config: Http4sStreamableServerTransportProviderConfig =
         Http4sStreamableServerTransportProviderConfig()
   )(implicit runtime: IORuntime): HttpRoutes[IO] =
