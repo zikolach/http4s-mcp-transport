@@ -16,7 +16,5 @@ jobs:
           distribution: temurin
           java-version: '17'
       - uses: sbt/setup-sbt@v1
-      - name: Check formatting
-        run: sbt "scalafmtCheckAll"
-      - name: Compile and test
-        run: sbt "+compile; +transport / Test / testOnly io.github.http4smcp.Http4sStreamableServerTransportProviderSuite; simpleServer/compile"
+      - name: Validate
+        run: sbt "scalafmtCheckAll; +compile; +transport / Test / testOnly io.github.http4smcp.Http4sStreamableServerTransportProviderSuite; simpleServer/compile"
