@@ -1,0 +1,21 @@
+# sbt and Scala build outputs
+target/
+project/target/
+project/project/target/
+
+# Metals, Bloop, and BSP local state
+.metals/
+.bloop/
+.bsp/
+
+# Local editor and OS files
+.idea/
+.vscode/
+.DS_Store
+
+# Local environment files
+.env
+.env.*
+
+# Agent/workflow local files
+.pi/
