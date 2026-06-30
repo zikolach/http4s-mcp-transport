@@ -324,9 +324,14 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
 
   test("Reactor Mono subscription is disposed when IO is canceled") {
     for {
-      canceled <- Ref.of[IO, Boolean](false)
-      mono = Mono.never[Void]().doOnCancel(() => canceled.set(true).unsafeRunAndForget())
+      canceled   <- Ref.of[IO, Boolean](false)
+      subscribed <- Semaphore[IO](0)
+      mono = Mono
+        .never[Void]()
+        .doOnSubscribe(_ => subscribed.release.unsafeRunAndForget())
+        .doOnCancel(() => canceled.set(true).unsafeRunAndForget())
       fiber <- ReactorInterop.monoToIO(mono).start
+      _     <- subscribed.acquire.timeout(2.seconds)
       _     <- fiber.cancel
       _     <- waitForTrue(canceled)
     } yield ()
