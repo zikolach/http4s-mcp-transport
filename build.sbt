@@ -82,3 +82,9 @@ lazy val simpleServer = (project in file("examples/simple-server"))
       "com.comcast" %% "ip4s-core" % "3.8.0"
     )
   )
+Global / excludeLintKeys ++= Set(
+  ThisBuild / SettingKey[Boolean]("gitUncommittedChanges"),
+  root / SettingKey[Option[String]]("gitDescribedVersion"),
+  transport / SettingKey[Option[String]]("gitDescribedVersion"),
+  simpleServer / SettingKey[Option[String]]("gitDescribedVersion")
+)
