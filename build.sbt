@@ -1,3 +1,6 @@
+import com.github.sbt.git.SbtGit.GitKeys.gitUncommittedChanges
+import sbtdynver.DynVerPlugin.autoImport.gitDescribedVersion
+
 ThisBuild / scalaVersion := "2.13.18"
 ThisBuild / crossScalaVersions := Seq("2.13.18", "3.3.7")
 ThisBuild / organization := "io.github.zikolach"
@@ -13,6 +16,8 @@ ThisBuild / developers := List(
   )
 )
 ThisBuild / scalacOptions ++= Seq("-deprecation", "-feature", "-unchecked")
+ThisBuild / scalacOptions := (ThisBuild / scalacOptions).value.distinct
+Global / excludeLintKeys ++= Set(gitUncommittedChanges, gitDescribedVersion)
 ThisBuild / Test / fork := true
 ThisBuild / publish / skip := true
 ThisBuild / publishMavenStyle := true
