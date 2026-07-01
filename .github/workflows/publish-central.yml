@@ -106,8 +106,9 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           changelog_notes="$(
             awk -v version="$version" '
-              $0 ~ "^## \[" version "\]" { in_section = 1; print; next }
-              in_section && /^## \[/ { exit }
+              index($0, "## [" version "]") == 1 { in_section = 1; print; next }
+              in_section && index($0, "## [") == 1 { exit }
+              in_section && $0 ~ /^\[[^]]+\]:/ { exit }
               in_section { print }
             ' CHANGELOG.md
           )"
