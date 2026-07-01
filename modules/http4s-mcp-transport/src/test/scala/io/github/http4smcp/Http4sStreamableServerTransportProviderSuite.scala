@@ -1,5 +1,6 @@
 package io.github.http4smcp
 
+import cats.effect.Deferred
 import cats.effect.IO
 import cats.effect.Ref
 import cats.effect.std.Semaphore
@@ -339,9 +340,13 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
 
   test("IO fiber is canceled when Reactor subscriber disposes") {
     for {
+      started  <- Deferred[IO, Unit]
       canceled <- Ref.of[IO, Boolean](false)
-      mono = ReactorInterop.ioUnitToMono(IO.never.onCancel(canceled.set(true)))
+      mono = ReactorInterop.ioUnitToMono(
+        started.complete(()).void >> IO.never.onCancel(canceled.set(true))
+      )
       disposable <- IO(mono.subscribe())
+      _          <- started.get.timeout(2.seconds)
       _          <- IO(disposable.dispose())
       _          <- waitForTrue(canceled)
     } yield ()

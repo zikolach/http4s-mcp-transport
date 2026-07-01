@@ -12,8 +12,7 @@ ThisBuild / developers := List(
     url = url("https://github.com/zikolach")
   )
 )
-ThisBuild / scalacOptions ++= Seq("-deprecation", "-feature", "-unchecked")
-ThisBuild / scalacOptions := (ThisBuild / scalacOptions).value.distinct
+ThisBuild / scalacOptions := Seq("-deprecation", "-feature", "-unchecked")
 ThisBuild / Test / fork := true
 ThisBuild / publish / skip := true
 ThisBuild / publishMavenStyle := true
