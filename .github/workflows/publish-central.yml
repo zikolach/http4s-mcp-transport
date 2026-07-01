@@ -19,13 +19,6 @@ jobs:
     name: Publish to Maven Central
     runs-on: ubuntu-latest
 
-    env:
-      SONATYPE_USERNAME: ${{ secrets.MILL_SONATYPE_USERNAME }}
-      SONATYPE_PASSWORD: ${{ secrets.MILL_SONATYPE_PASSWORD }}
-      PGP_SECRET: ${{ secrets.MILL_PGP_SECRET_BASE64 }}
-      PGP_PASSPHRASE: ${{ secrets.MILL_PGP_PASSPHRASE }}
-      HTTP4S_MCP_TRANSPORT_VERSION: ${{ inputs.version }}
-
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -35,6 +28,7 @@ jobs:
           GIT_CONFIG_VALUE_0: main
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Java
         uses: actions/setup-java@v5
@@ -59,7 +53,25 @@ jobs:
       - name: Validate build
         run: sbt "scalafmtCheckAll; +compile; +transport / Test / testOnly io.github.http4smcp.Http4sStreamableServerTransportProviderSuite; simpleServer/compile"
 
+      - name: Import PGP signing key
+        env:
+          PGP_SECRET: ${{ secrets.MILL_PGP_SECRET_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${PGP_SECRET:-}" ]; then
+            echo "PGP_SECRET is required for Maven Central signing." >&2
+            exit 2
+          fi
+          printf '%s' "$PGP_SECRET" | base64 --decode | gpg --batch --import
+          gpg --batch --list-secret-keys --with-colons | grep -q '^sec'
+
       - name: Publish packages to Maven Central
+        env:
+          SONATYPE_USERNAME: ${{ secrets.MILL_SONATYPE_USERNAME }}
+          SONATYPE_PASSWORD: ${{ secrets.MILL_SONATYPE_PASSWORD }}
+          PGP_SECRET: ${{ secrets.MILL_PGP_SECRET_BASE64 }}
+          PGP_PASSPHRASE: ${{ secrets.MILL_PGP_PASSPHRASE }}
+          HTTP4S_MCP_TRANSPORT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           version="${HTTP4S_MCP_TRANSPORT_VERSION:-}"
