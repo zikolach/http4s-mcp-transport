@@ -53,6 +53,9 @@ jobs:
       - name: Validate build
         run: sbt "scalafmtCheckAll; +compile; +transport / Test / testOnly io.github.http4smcp.Http4sStreamableServerTransportProviderSuite; simpleServer/compile"
 
+      - name: Stop validation sbt server
+        run: sbt --client shutdown || true
+
       - name: Import PGP signing key
         env:
           PGP_SECRET: ${{ secrets.MILL_PGP_SECRET_BASE64 }}
