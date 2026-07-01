@@ -12,7 +12,7 @@ on:
         type: string
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   publish-maven-central:
@@ -74,6 +74,56 @@ jobs:
           echo "Publishing http4s-mcp-transport ${version} to Maven Central"
           if [[ "$version" == *-SNAPSHOT ]]; then
             HTTP4S_MCP_TRANSPORT_VERSION="$version" sbt "+publishSigned"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            HTTP4S_MCP_TRANSPORT_VERSION="$version" CI_RELEASE="+publishSigned" sbt ci-release
           else
-            HTTP4S_MCP_TRANSPORT_VERSION="$version" GITHUB_REF="refs/tags/v${version}" CI_RELEASE="+publishSigned" sbt ci-release
+            echo "Stable releases must run from a v* tag so sbt-ci-release can publish." >&2
+            echo "Push tag v${version} or rerun this workflow from that tag." >&2
+            exit 2
+          fi
+
+      - name: Create GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          changelog_notes="$(
+            awk -v version="$version" '
+              $0 ~ "^## \[" version "\]" { in_section = 1; print; next }
+              in_section && /^## \[/ { exit }
+              in_section { print }
+            ' CHANGELOG.md
+          )"
+          if [ -z "$changelog_notes" ]; then
+            changelog_notes="No changelog section found for ${GITHUB_REF_NAME}."
+          fi
+          notes=$(cat <<EOF
+          ${changelog_notes}
+
+          Published to Maven Central.
+
+          ## sbt
+
+          \`\`\`scala
+          libraryDependencies += "io.github.zikolach" %% "http4s-mcp-transport" % "${version}"
+          \`\`\`
+
+          ## Maven coordinates
+
+          - \`io.github.zikolach:http4s-mcp-transport_2.13:${version}\`
+          - \`io.github.zikolach:http4s-mcp-transport_3:${version}\`
+          EOF
+          )
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --notes "$notes"
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$GITHUB_REF_NAME" \
+              --notes "$notes"
           fi

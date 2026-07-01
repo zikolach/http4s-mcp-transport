@@ -25,7 +25,11 @@ The root project and example project are not published.
 
 ## Maven Central
 
-The `Publish Maven Central` workflow publishes on `v*` tags and can also be run manually with an explicit version.
+The `Publish Maven Central` workflow publishes stable releases on `v*` tags.
+It can also be run manually for `-SNAPSHOT` versions.
+Manual stable runs fail intentionally because `sbt-ci-release` requires a real tag ref for stable publishing.
+
+After a successful stable tag publish, the workflow creates or updates the GitHub Release from `CHANGELOG.md` and includes Maven Central coordinates.
 
 Required GitHub Actions secrets match the names used by `../sui`:
 
