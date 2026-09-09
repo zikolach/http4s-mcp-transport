@@ -125,3 +125,142 @@ Applications SHALL retain the provider instance used to create the MCP server an
 - **WHEN** application code migrates to version 0.2.0
 - **THEN** `Http4sStreamableServerTransportProvider.routes` is no longer part of the public API
 - **AND** migration documentation directs the application to retain the provider instance
+
+### Requirement: Finite session admission
+The provider SHALL expose a positive finite `maxSessions` setting with a default of 1,024 sessions per provider. Pending initializations, registered sessions, and sessions still releasing provider-owned resources SHALL count against the same limit.
+
+#### Scenario: Concurrent initialization reaches capacity
+- **WHEN** concurrent valid initialization requests would exceed `maxSessions`
+- **THEN** the provider atomically reserves no more than `maxSessions` slots
+- **AND** returns HTTP 503 for excess requests without calling the session factory or waiting for admission capacity
+- **AND** does not evict existing sessions to admit new ones
+
+#### Scenario: Initialization registers successfully
+- **WHEN** a reserved initialization completes and registers its session
+- **THEN** the same reservation becomes the registered session's capacity slot without a release-and-reacquire gap
+
+#### Scenario: Initialization fails or is canceled
+- **WHEN** initialization fails or is canceled after reserving capacity
+- **THEN** the provider closes any acquired session and releases provider-owned resources
+- **AND** releases the reservation exactly once
+
+#### Scenario: Shutdown races initialization
+- **WHEN** shutdown begins while an initialization is pending
+- **THEN** the initialization cannot register a usable session after shutdown admission closes
+- **AND** its acquired provider resources and reservation are released
+
+#### Scenario: Session capacity is invalid
+- **WHEN** configuration sets `maxSessions` to zero or a negative value
+- **THEN** configuration fails rather than interpreting the value as unlimited
+
+### Requirement: Idle session expiry
+The provider SHALL expose a positive finite `sessionIdleTimeout` with a default of 30 minutes and enforce it using a monotonic clock. Validated requests admitted to a session SHALL count as client activity. Active request processing SHALL prevent idle expiry; completion of the last active operation SHALL start a fresh idle interval. Passive SSE connections and server-generated traffic SHALL NOT prevent idle expiry.
+
+#### Scenario: Session becomes idle
+- **WHEN** a session has no active processing and its idle interval reaches `sessionIdleTimeout`
+- **THEN** new requests using that session receive HTTP 404
+- **AND** the provider begins termination within one documented expiry sweep interval without requiring another client request
+
+#### Scenario: Client activity refreshes idle time
+- **WHEN** a validated request is admitted before the session expires
+- **THEN** it refreshes client activity
+- **AND** rejected requests, malformed bodies, outbound notifications, and server keepalive traffic do not refresh activity
+
+#### Scenario: Long-running request or replay is active
+- **WHEN** an admitted request or replay is still processing
+- **THEN** idle expiry does not terminate that session
+- **AND** the idle interval begins anew when the last active operation completes or is canceled
+
+#### Scenario: Only a passive SSE connection remains
+- **WHEN** live GET SSE remains connected without active processing or new client requests for `sessionIdleTimeout`
+- **THEN** the provider expires the session and closes its provider-owned SSE resources
+
+#### Scenario: Expiry races a request
+- **WHEN** activity admission races the expiry decision
+- **THEN** one atomic lifecycle decision either admits the operation or retires the session
+- **AND** no operation acquires an already retired session
+
+#### Scenario: Idle timeout is invalid
+- **WHEN** configuration supplies a nonpositive or non-finite idle timeout
+- **THEN** configuration fails rather than disabling expiry
+
+### Requirement: Shared session termination
+DELETE, expiry, and provider shutdown SHALL share idempotent per-session termination. Termination SHALL prevent new resource acquisition, release all provider-owned session resources, invoke SDK session cleanup, and release admission capacity exactly once. A caller canceling its wait SHALL NOT cancel the shared cleanup.
+
+#### Scenario: Termination paths race
+- **WHEN** DELETE, expiry, and shutdown target the same session concurrently
+- **THEN** the provider runs one shared termination operation for that session
+- **AND** does not double-release its capacity reservation
+
+#### Scenario: Resource cleanup fails
+- **WHEN** closing one owned resource fails
+- **THEN** the provider still attempts cleanup of every other owned resource
+- **AND** reports the failure through the transport-owned safe logging policy
+
+#### Scenario: Provider shuts down
+- **WHEN** provider shutdown completes
+- **THEN** its expiry worker has stopped
+- **AND** its provider-owned session resources and admission reservations have been released
+- **AND** it admits no new sessions or stream resources
+
+### Requirement: Provider-owned response resources
+The provider SHALL own every transport, POST processing worker, GET listener handle, and replay subscription that it acquires. Ownership SHALL be registered atomically against session termination. This guarantee SHALL NOT claim cleanup of inaccessible SDK-internal state or forced termination of uninterruptible application code.
+
+#### Scenario: Response body is never consumed
+- **WHEN** the provider returns a response whose body is never consumed
+- **THEN** no worker, transport, listener, replay subscription, or active-operation lease remains allocated solely for that body
+
+#### Scenario: Response body starts after session termination
+- **WHEN** a previously returned response body begins consumption after its session has terminated
+- **THEN** it does not start SDK processing or acquire new live resources for that session
+
+#### Scenario: Consumer disconnects or body processing fails
+- **WHEN** an SSE consumer cancels or its response body fails during replay or live processing
+- **THEN** the provider cancels processing and replay for that response and releases its acquired listener and transport
+- **AND** it awaits provider finalizers and releases blocked sends without requiring further client consumption
+
+#### Scenario: Session owns multiple responses
+- **WHEN** a session terminates with multiple GET listeners, a replay subscription, and POST response workers
+- **THEN** all provider-owned responses terminate, including older GET listeners no longer referenced by the SDK
+- **AND** cleanup does not depend solely on `McpStreamableServerSession.closeGracefully`
+
+#### Scenario: Acquisition races termination
+- **WHEN** acquiring a transport, listener, replay subscription, or worker races session termination
+- **THEN** the resource is either registered for termination or released by the acquiring operation
+- **AND** no acquired resource becomes unowned
+
+### Requirement: Payload-free transport diagnostic logs
+Transport-owned diagnostic logs SHALL use fixed operation and failure codes without original throwable objects, exception messages, causes, suppressed exceptions, payloads, headers, parameters, raw session identifiers, or client-controlled strings. This requirement SHALL cover every enabled transport log level and SHALL NOT claim to sanitize SDK logs, application logs, HTTP error text, or SDK-generated JSON-RPC errors.
+
+#### Scenario: Processing or cleanup exception contains a secret
+- **WHEN** initialization, request processing, notification delivery, response acceptance, or cleanup fails with secret markers in exception messages, causes, or suppressed exceptions
+- **THEN** a transport-owned event identifies the operation and failure using fixed codes
+- **AND** neither its formatted output, argument data, nor throwable data contains those markers
+
+#### Scenario: Request-controlled values contain a secret
+- **WHEN** payloads, parameters, headers, or session identifiers contain secret markers
+- **THEN** transport-owned diagnostic logs do not include those values
+
+#### Scenario: Application enables SDK logging
+- **WHEN** the application configures SDK or handler loggers
+- **THEN** the transport does not modify global logger levels or install application-wide filters
+- **AND** documentation identifies SDK-originated payload logging as outside the transport-owned guarantee
+
+### Requirement: Explicit upstream capability coverage
+Before accepting session and lifecycle hardening, verification SHALL identify the MCP SDK version, inspect its session admission, expiry, and cleanup behavior, and run focused lifecycle tests through the http4s provider. Source inspection alone SHALL NOT establish implementation acceptance.
+
+#### Scenario: SDK lacks admission or expiry controls
+- **WHEN** the selected SDK does not enforce session caps or idle expiry for this provider
+- **THEN** the provider owns both policies
+- **AND** tests demonstrate concurrent capacity enforcement, reservation release, and idle expiry through its routes
+
+#### Scenario: SDK cleanup is incomplete
+- **WHEN** supported SDK cleanup or cancellation leaves internal response-stream state or in-flight keepalive work
+- **THEN** verification records the SDK version, source locations, and observed limitation
+- **AND** separately verifies the provider-owned cleanup guarantee
+- **AND** does not use a fork, reflection, or global logging changes to conceal the limitation
+
+#### Scenario: SDK limitations are documented
+- **WHEN** version 0.2.0 is prepared for release
+- **THEN** documentation states the tested provider-owned guarantee and residual SDK cleanup and logging limitations
+- **AND** it does not claim comprehensive SDK cleanup or end-to-end payload-free logging
