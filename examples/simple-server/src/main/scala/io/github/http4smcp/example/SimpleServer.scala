@@ -17,7 +17,7 @@ object SimpleServer extends IOApp.Simple {
 
     McpServer
       .sync(provider)
-      .serverInfo("http4s-mcp-simple-server", "0.1.0")
+      .serverInfo("http4s-mcp-simple-server", "0.1.1")
       .toolCall(
         McpSchema.Tool
           .builder(

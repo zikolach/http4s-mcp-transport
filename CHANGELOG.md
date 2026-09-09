@@ -7,6 +7,8 @@ and this project uses semantic versioning while it remains pre-1.0.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-09-09
+
 ### Changed
 
 - Limited MCP POST request bodies to 16 MiB. Larger bodies now return HTTP 413.
@@ -31,5 +33,6 @@ and this project uses semantic versioning while it remains pre-1.0.
 - Added Scalafmt, GitHub Actions CI, and Maven Central publishing configuration.
 - Added release automation for GitHub Releases with Maven Central coordinates.
 
-[Unreleased]: https://github.com/zikolach/http4s-mcp-transport/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/zikolach/http4s-mcp-transport/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/zikolach/http4s-mcp-transport/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/zikolach/http4s-mcp-transport/releases/tag/v0.1.0
