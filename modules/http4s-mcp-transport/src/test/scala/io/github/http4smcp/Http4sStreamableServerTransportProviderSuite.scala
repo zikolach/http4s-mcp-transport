@@ -5,6 +5,12 @@ import cats.effect.IO
 import cats.effect.Ref
 import cats.effect.std.Semaphore
 import cats.syntax.all._
+import ch.qos.logback.classic.Level
+import ch.qos.logback.classic.Logger
+import ch.qos.logback.classic.spi.ILoggingEvent
+import ch.qos.logback.core.read.ListAppender
+import fs2.Chunk
+import fs2.Stream
 import io.github.http4smcp.internal.ReactorInterop
 import io.modelcontextprotocol.common.McpTransportContext
 import io.modelcontextprotocol.json.McpJsonDefaults
@@ -14,6 +20,7 @@ import io.modelcontextprotocol.server.McpRequestHandler
 import io.modelcontextprotocol.spec.HttpHeaders
 import io.modelcontextprotocol.spec.McpSchema
 import io.modelcontextprotocol.spec.McpStreamableServerSession
+import io.modelcontextprotocol.spec.McpStreamableServerTransport
 import io.modelcontextprotocol.spec.ProtocolVersions
 import munit.CatsEffectSuite
 import org.http4s.Header
@@ -22,6 +29,7 @@ import org.http4s.Request
 import org.http4s.Status
 import org.http4s.Uri
 import org.http4s.syntax.all._
+import org.slf4j.LoggerFactory
 import org.typelevel.ci.CIString
 import reactor.core.publisher.Flux
 import reactor.core.publisher.Mono
@@ -29,13 +37,19 @@ import reactor.core.publisher.Sinks
 
 import java.time.Duration
 import java.util.UUID
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import scala.concurrent.duration._
 import scala.jdk.CollectionConverters._
 
 final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite {
-  private val mapper = McpJsonDefaults.getMapper()
+  private val mapper          = McpJsonDefaults.getMapper()
+  private val MaxRequestBytes = 16 * 1024 * 1024
+
+  LoggerFactory.getLogger(classOf[McpSchema]).asInstanceOf[Logger].setLevel(Level.INFO)
 
   test("initialize creates a session and returns Mcp-Session-Id") {
     for {
@@ -78,15 +92,15 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
 
   test("GET stream receives notifyClient message") {
     for {
-      provider  <- testProvider()
+      listening <- Deferred[IO, Unit]
+      provider  <- testProvider(listeningStarted = Some(listening.complete(()).void))
       sessionId <- initialize(provider)
       response  <- provider.routes.orNotFound.run(get(Some(sessionId)))
       read      <- response.bodyText.interruptAfter(1.second).compile.string.start
-      _         <- IO.sleep(100.millis)
+      _         <- listening.get.timeout(1.second)
       _         <- ReactorInterop.monoToIO(
         provider.notifyClient(sessionId, "server/notice", java.util.Map.of("ok", "true"))
       )
-      _    <- IO.sleep(100.millis)
       _    <- ReactorInterop.monoToIO(provider.closeGracefully())
       body <- read.joinWithNever
     } yield {
@@ -98,17 +112,20 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
 
   test("notifyClients isolates failed delivery") {
     for {
-      first          <- testProvider()
-      second         <- testProvider()
-      firstSession   <- initialize(first)
-      secondSession  <- initialize(second)
-      firstResponse  <- first.routes.orNotFound.run(get(Some(firstSession)))
-      secondResponse <- second.routes.orNotFound.run(get(Some(secondSession)))
-      firstRead      <- firstResponse.bodyText.interruptAfter(1.second).compile.string.start
-      secondRead     <- secondResponse.bodyText.interruptAfter(1.second).compile.string.start
-      _              <- IO.sleep(100.millis)
-      _              <- ReactorInterop.monoToIO(first.closeGracefully())
-      _              <- ReactorInterop.monoToIO(
+      firstListening  <- Deferred[IO, Unit]
+      secondListening <- Deferred[IO, Unit]
+      first           <- testProvider(listeningStarted = Some(firstListening.complete(()).void))
+      second          <- testProvider(listeningStarted = Some(secondListening.complete(()).void))
+      firstSession    <- initialize(first)
+      secondSession   <- initialize(second)
+      firstResponse   <- first.routes.orNotFound.run(get(Some(firstSession)))
+      secondResponse  <- second.routes.orNotFound.run(get(Some(secondSession)))
+      firstRead       <- firstResponse.bodyText.interruptAfter(1.second).compile.string.start
+      secondRead      <- secondResponse.bodyText.interruptAfter(1.second).compile.string.start
+      _               <- firstListening.get.timeout(1.second)
+      _               <- secondListening.get.timeout(1.second)
+      _               <- ReactorInterop.monoToIO(first.closeGracefully())
+      _               <- ReactorInterop.monoToIO(
         second.notifyClients("broadcast", java.util.Map.of("ok", "true"))
       )
       _          <- ReactorInterop.monoToIO(second.closeGracefully())
@@ -152,18 +169,29 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
   test("GET with Last-Event-ID asks the SDK session to replay before live stream") {
     for {
       replayed  <- Ref.of[IO, Option[String]](None)
-      provider  <- testProvider(replayObserver = Some(id => replayed.set(Some(id.toString))))
+      listening <- Deferred[IO, Unit]
+      provider  <- testProvider(
+        replayObserver = Some(id => replayed.set(Some(id.toString))),
+        listeningStarted = Some(listening.complete(()).void)
+      )
       sessionId <- initialize(provider)
       response  <- provider.routes.orNotFound.run(
         get(Some(sessionId)).putHeaders(Header.Raw(CIString(HttpHeaders.LAST_EVENT_ID), "last-1"))
       )
-      bodyRef <- Ref.of[IO, String]("")
-      read    <- response.bodyText.evalMap(chunk => bodyRef.update(_ + chunk)).compile.drain.start
-      _       <- waitForBody(bodyRef, "replayed")
-      _       <- ReactorInterop.monoToIO(
+      bodyRef      <- Ref.of[IO, String]("")
+      replayedBody <- Deferred[IO, Unit]
+      afterBody    <- Deferred[IO, Unit]
+      read         <- readBodyAndSignal(
+        response,
+        bodyRef,
+        List("replayed" -> replayedBody, "after-replay" -> afterBody)
+      )
+      _ <- replayedBody.get.timeout(2.seconds)
+      _ <- listening.get.timeout(2.seconds)
+      _ <- ReactorInterop.monoToIO(
         provider.notifyClient(sessionId, "after-replay", java.util.Map.of("ok", "true"))
       )
-      _    <- waitForBody(bodyRef, "after-replay")
+      _    <- afterBody.get.timeout(2.seconds)
       _    <- ReactorInterop.monoToIO(provider.closeGracefully())
       _    <- read.cancel
       body <- bodyRef.get
@@ -181,9 +209,11 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
     for {
       replayStarted <- Semaphore[IO](0)
       replayRelease <- IO(Sinks.empty[Void]())
+      listening     <- Deferred[IO, Unit]
       provider      <- testProvider(
         replayObserver = Some(_ => replayStarted.release),
-        replayGate = Some(replayRelease.asMono())
+        replayGate = Some(replayRelease.asMono()),
+        listeningStarted = Some(listening.complete(()).void)
       )
       sessionId <- initialize(provider)
       response  <- provider.routes.orNotFound.run(
@@ -191,18 +221,25 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
           Header.Raw(CIString(HttpHeaders.LAST_EVENT_ID), "last-delayed")
         )
       )
-      bodyRef <- Ref.of[IO, String]("")
-      read    <- response.bodyText.evalMap(chunk => bodyRef.update(_ + chunk)).compile.drain.start
-      _       <- replayStarted.acquire.timeout(1.second)
-      _       <- ReactorInterop
+      bodyRef      <- Ref.of[IO, String]("")
+      replayedBody <- Deferred[IO, Unit]
+      afterBody    <- Deferred[IO, Unit]
+      read         <- readBodyAndSignal(
+        response,
+        bodyRef,
+        List("replayed" -> replayedBody, "after-replay" -> afterBody)
+      )
+      _ <- replayStarted.acquire.timeout(1.second)
+      _ <- ReactorInterop
         .monoToIO(provider.notifyClient(sessionId, "during-replay", java.util.Map.of("ok", "true")))
         .attempt
       _ <- IO(replayRelease.tryEmitEmpty()).void
-      _ <- waitForBody(bodyRef, "replayed")
+      _ <- replayedBody.get.timeout(2.seconds)
+      _ <- listening.get.timeout(2.seconds)
       _ <- ReactorInterop.monoToIO(
         provider.notifyClient(sessionId, "after-replay", java.util.Map.of("ok", "true"))
       )
-      _    <- waitForBody(bodyRef, "after-replay")
+      _    <- afterBody.get.timeout(2.seconds)
       _    <- ReactorInterop.monoToIO(provider.closeGracefully())
       _    <- read.cancel
       body <- bodyRef.get
@@ -241,15 +278,17 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
 
   test("notifyClients continues when one session stream has disconnected") {
     for {
-      provider       <- testProvider()
+      listening      <- Semaphore[IO](0)
+      provider       <- testProvider(listeningStarted = Some(listening.release))
       firstSession   <- initialize(provider)
       secondSession  <- initialize(provider)
       firstResponse  <- provider.routes.orNotFound.run(get(Some(firstSession)))
       firstRead      <- firstResponse.bodyText.interruptAfter(100.millis).compile.string.start
+      _              <- listening.acquire.timeout(1.second)
       _              <- firstRead.joinWithNever
       secondResponse <- provider.routes.orNotFound.run(get(Some(secondSession)))
       secondRead     <- secondResponse.bodyText.interruptAfter(1.second).compile.string.start
-      _              <- IO.sleep(100.millis)
+      _              <- listening.acquire.timeout(1.second)
       _              <- ReactorInterop.monoToIO(
         provider.notifyClients("broadcast", java.util.Map.of("ok", "true"))
       )
@@ -323,62 +362,321 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
     } yield assertEquals(response.status, Status.ServiceUnavailable)
   }
 
+  test("concurrent closeGracefully callers wait for the same session cleanup") {
+    val gate          = Sinks.empty[Void]()
+    val closeAttempts = new AtomicInteger(0)
+
+    for {
+      closeStarted     <- Deferred[IO, Unit]
+      secondSubscribed <- Deferred[IO, Unit]
+      secondCompleted  <- Deferred[IO, Unit]
+      closeMono = gate
+        .asMono()
+        .doOnSubscribe { _ =>
+          closeAttempts.incrementAndGet()
+          closeStarted.complete(()).void.unsafeRunAndForget()
+        }
+      provider <- testProvider(closeGate = Some(closeMono))
+      _        <- initialize(provider)
+      first    <- ReactorInterop.monoToIO(provider.closeGracefully()).start
+      _        <- closeStarted.get.timeout(2.seconds)
+      second   <- ReactorInterop
+        .monoToIO(
+          provider
+            .closeGracefully()
+            .doOnSubscribe(_ => secondSubscribed.complete(()).void.unsafeRunAndForget())
+            .doOnSuccess(_ => secondCompleted.complete(()).void.unsafeRunAndForget())
+        )
+        .start
+      _               <- secondSubscribed.get.timeout(2.seconds)
+      completedBefore <- secondCompleted.tryGet
+      _               <- IO(assertEquals(completedBefore, None))
+      _               <- IO(gate.tryEmitEmpty()).void
+      _               <- first.joinWithNever.timeout(2.seconds)
+      _               <- second.joinWithNever.timeout(2.seconds)
+      _               <- secondCompleted.get.timeout(2.seconds)
+    } yield assertEquals(closeAttempts.get(), 1)
+  }
+
+  test("canceling the first closeGracefully subscriber does not cancel cleanup") {
+    val gate          = Sinks.empty[Void]()
+    val closeAttempts = new AtomicInteger(0)
+
+    for {
+      closeStarted    <- Deferred[IO, Unit]
+      retrySubscribed <- Deferred[IO, Unit]
+      retryCompleted  <- Deferred[IO, Unit]
+      closeMono = gate
+        .asMono()
+        .doOnSubscribe { _ =>
+          closeAttempts.incrementAndGet()
+          closeStarted.complete(()).void.unsafeRunAndForget()
+        }
+      provider <- testProvider(closeGate = Some(closeMono))
+      _        <- initialize(provider)
+      first    <- ReactorInterop.monoToIO(provider.closeGracefully()).start
+      _        <- closeStarted.get.timeout(2.seconds)
+      _        <- first.cancel
+      retry    <- ReactorInterop
+        .monoToIO(
+          provider
+            .closeGracefully()
+            .doOnSubscribe(_ => retrySubscribed.complete(()).void.unsafeRunAndForget())
+            .doOnSuccess(_ => retryCompleted.complete(()).void.unsafeRunAndForget())
+        )
+        .start
+      _               <- retrySubscribed.get.timeout(2.seconds)
+      completedBefore <- retryCompleted.tryGet
+      _               <- IO(assertEquals(completedBefore, None))
+      _               <- IO(gate.tryEmitEmpty()).void
+      _               <- retry.joinWithNever.timeout(2.seconds)
+      _               <- retryCompleted.get.timeout(2.seconds)
+    } yield assertEquals(closeAttempts.get(), 1)
+  }
+
+  test("POST accepts a body of exactly 16 MiB") {
+    for {
+      provider  <- testProvider()
+      sessionId <- initialize(provider)
+      body = notificationWithSize(MaxRequestBytes)
+      _    = assertEquals(
+        body.getBytes(java.nio.charset.StandardCharsets.UTF_8).length,
+        MaxRequestBytes
+      )
+      response <- provider.routes.orNotFound.run(post(body, Some(sessionId)))
+    } yield assertEquals(response.status, Status.Accepted)
+  }
+
+  test("POST rejects an oversized declared Content-Length") {
+    for {
+      provider <- testProvider()
+      request = post(notificationJson).putHeaders(
+        Header.Raw(CIString("Content-Length"), (MaxRequestBytes + 1).toString)
+      )
+      response <- provider.routes.orNotFound.run(request)
+    } yield assertEquals(response.status, Status.PayloadTooLarge)
+  }
+
+  test("POST rejects an oversized streamed body without Content-Length") {
+    for {
+      provider <- testProvider()
+      request = Request[IO](method = Method.POST, uri = uri"/mcp")
+        .withBodyStream(Stream.chunk(Chunk.array(Array.fill[Byte](MaxRequestBytes + 1)('x'))))
+        .putHeaders(commonHeaders(None))
+      response <- provider.routes.orNotFound.run(request)
+    } yield assertEquals(response.status, Status.PayloadTooLarge)
+  }
+
+  test("shutdown prevents a concurrently created session from being registered") {
+    val started          = new CountDownLatch(1)
+    val release          = new CountDownLatch(1)
+    val closed           = new AtomicBoolean(false)
+    val startSessionHook = (_: String) => {
+      started.countDown()
+      if (!release.await(2, TimeUnit.SECONDS))
+        throw new IllegalStateException("timed out waiting to release session creation")
+    }
+
+    for {
+      provider <- testProvider(
+        startSessionHook = Some(startSessionHook),
+        closeObserver = Some(() => closed.set(true))
+      )
+      initialization <- provider.routes.orNotFound.run(post(initializeJson)).start
+      _              <- IO.blocking(assert(started.await(2, TimeUnit.SECONDS)))
+      _              <- ReactorInterop.monoToIO(provider.closeGracefully())
+      _              <- IO(release.countDown())
+      response       <- initialization.joinWithNever.timeout(2.seconds)
+      rejected       <- provider.routes.orNotFound.run(post(initializeJson))
+    } yield {
+      assertEquals(response.status, Status.ServiceUnavailable)
+      assert(closed.get())
+      assertEquals(rejected.status, Status.ServiceUnavailable)
+    }
+  }
+
+  test("canceling during session creation closes and does not register the created session") {
+    val started          = new CountDownLatch(1)
+    val release          = new CountDownLatch(1)
+    val closed           = new AtomicBoolean(false)
+    val sessionId        = new AtomicReference[String]()
+    val startSessionHook = (id: String) => {
+      sessionId.set(id)
+      started.countDown()
+      if (!release.await(2, TimeUnit.SECONDS))
+        throw new IllegalStateException("timed out waiting to release session creation")
+    }
+
+    for {
+      provider <- testProvider(
+        startSessionHook = Some(startSessionHook),
+        closeObserver = Some(() => closed.set(true))
+      )
+      initialization  <- provider.routes.orNotFound.run(post(initializeJson)).start
+      _               <- IO.blocking(assert(started.await(2, TimeUnit.SECONDS)))
+      cancelRequested <- Deferred[IO, Unit]
+      cancellation    <- (cancelRequested.complete(()).void *> initialization.cancel).start
+      _               <- cancelRequested.get.timeout(2.seconds)
+      _               <- IO.cede
+      _               <- IO(release.countDown())
+      _               <- cancellation.joinWithNever.timeout(2.seconds)
+      _               <- initialization.join.timeout(2.seconds)
+      response <- provider.routes.orNotFound.run(post(notificationJson, Some(sessionId.get())))
+    } yield {
+      assert(closed.get())
+      assertEquals(response.status, Status.NotFound)
+    }
+  }
+
+  test("initialization result failure closes the started session") {
+    val closed = new AtomicBoolean(false)
+    for {
+      provider <- testProvider(
+        initResultFailure = Some(new IllegalStateException("initialization failed")),
+        closeObserver = Some(() => closed.set(true))
+      )
+      result <- provider.routes.orNotFound.run(post(initializeJson)).attempt
+    } yield {
+      assert(result.isLeft)
+      assert(closed.get())
+    }
+  }
+
+  test("transport orders send before close and ignores send after close") {
+    val notification = new McpSchema.JSONRPCNotification("test", java.util.Map.of())
+    for {
+      transport <- Http4sStreamableServerTransport.create("session", mapper)
+      read      <- transport.events.compile.toList.start
+      _         <- ReactorInterop.monoToIO(transport.sendMessage(notification))
+      _         <- ReactorInterop.monoToIO(transport.closeGracefully())
+      events    <- read.joinWithNever.timeout(2.seconds)
+      _         <- ReactorInterop.monoToIO(transport.sendMessage(notification))
+    } yield {
+      assertEquals(events.size, 1)
+      assertEquals(events.head.eventType, Some("message"))
+    }
+  }
+
+  test("accept failure is logged with session context and still returns Accepted") {
+    val appender = new ListAppender[ILoggingEvent]()
+    val logger   = LoggerFactory
+      .getLogger(classOf[Http4sStreamableServerTransportProvider])
+      .asInstanceOf[Logger]
+    appender.start()
+    logger.addAppender(appender)
+
+    (for {
+      provider  <- testProvider(acceptFailure = Some(new IllegalStateException("accept failed")))
+      sessionId <- initialize(provider)
+      response  <- provider.routes.orNotFound.run(post(notificationJson, Some(sessionId)))
+      events    <- IO(appender.list.asScala.toList)
+    } yield {
+      assertEquals(response.status, Status.Accepted)
+      assert(
+        events.exists(event =>
+          event.getLevel == Level.ERROR &&
+            event.getFormattedMessage.contains(sessionId) &&
+            event.getFormattedMessage.contains("notification")
+        )
+      )
+    }).guarantee(IO(logger.detachAppender(appender)))
+  }
+
+  test("POST response-stream failure closes the SSE body") {
+    for {
+      provider <- testProvider(
+        responseStreamFailure = Some(new IllegalStateException("response stream failed"))
+      )
+      sessionId <- initialize(provider)
+      response  <- provider.routes.orNotFound.run(post(requestJson, Some(sessionId)))
+      body      <- response.bodyText.compile.string.timeout(2.seconds)
+    } yield {
+      assertEquals(response.status, Status.Ok)
+      assertEquals(body, "")
+    }
+  }
+
   test("Reactor Mono subscription is disposed when IO is canceled") {
     for {
-      canceled   <- Ref.of[IO, Boolean](false)
+      canceled   <- Deferred[IO, Unit]
       subscribed <- Semaphore[IO](0)
       mono = Mono
         .never[Void]()
         .doOnSubscribe(_ => subscribed.release.unsafeRunAndForget())
-        .doOnCancel(() => canceled.set(true).unsafeRunAndForget())
+        .doOnCancel(() => canceled.complete(()).void.unsafeRunAndForget())
       fiber <- ReactorInterop.monoToIO(mono).start
       _     <- subscribed.acquire.timeout(2.seconds)
       _     <- fiber.cancel
-      _     <- waitForTrue(canceled)
+      _     <- canceled.get.timeout(2.seconds)
     } yield ()
   }
 
   test("IO fiber is canceled when Reactor subscriber disposes") {
     for {
       started  <- Deferred[IO, Unit]
-      canceled <- Ref.of[IO, Boolean](false)
+      canceled <- Deferred[IO, Unit]
       mono = ReactorInterop.ioUnitToMono(
-        started.complete(()).void >> IO.never.onCancel(canceled.set(true))
+        started.complete(()).void >> IO.never.onCancel(canceled.complete(()).void)
       )
       disposable <- IO(mono.subscribe())
       _          <- started.get.timeout(2.seconds)
       _          <- IO(disposable.dispose())
-      _          <- waitForTrue(canceled)
+      _          <- canceled.get.timeout(2.seconds)
     } yield ()
   }
 
-  private def waitForTrue(valueRef: Ref[IO, Boolean]): IO[Unit] =
-    valueRef.get
-      .flatMap { value =>
-        if (value) IO.unit
-        else IO.sleep(25.millis) >> waitForTrue(valueRef)
+  private def readBodyAndSignal(
+      response: org.http4s.Response[IO],
+      bodyRef: Ref[IO, String],
+      signals: List[(String, Deferred[IO, Unit])]
+  ): IO[cats.effect.FiberIO[Unit]] =
+    response.bodyText
+      .evalMap { chunk =>
+        bodyRef.updateAndGet(_ + chunk).flatMap { body =>
+          signals.traverse_ { case (text, signal) =>
+            if (body.contains(text)) signal.complete(()).void else IO.unit
+          }
+        }
       }
-      .timeout(2.seconds)
+      .compile
+      .drain
+      .start
 
-  private def waitForBody(bodyRef: Ref[IO, String], text: String): IO[Unit] =
-    bodyRef.get
-      .flatMap { body =>
-        if (body.contains(text)) IO.unit
-        else IO.sleep(25.millis) >> waitForBody(bodyRef, text)
-      }
-      .timeout(2.seconds)
+  private def notificationWithSize(size: Int): String = {
+    val prefix = """{"jsonrpc":"2.0","method":"notifications/initialized","params":{"padding":""""
+    val suffix = """"}}"""
+    prefix + ("x" * (size - prefix.length - suffix.length)) + suffix
+  }
 
   private def testProvider(
       notificationHandler: Option[McpTransportContext => IO[Unit]] = None,
       replayObserver: Option[AnyRef => IO[Unit]] = None,
       replayGate: Option[Mono[Void]] = None,
+      listeningStarted: Option[IO[Unit]] = None,
+      startSessionHook: Option[String => Unit] = None,
+      closeObserver: Option[() => Unit] = None,
+      closeGate: Option[Mono[Void]] = None,
+      initResultFailure: Option[Throwable] = None,
+      acceptFailure: Option[Throwable] = None,
+      responseStreamFailure: Option[Throwable] = None,
       config: Http4sStreamableServerTransportProviderConfig =
         Http4sStreamableServerTransportProviderConfig()
   ): IO[Http4sStreamableServerTransportProvider] =
     IO {
       val provider = Http4sStreamableServerTransportProvider(jsonMapper = mapper, config = config)
       provider.setSessionFactory(
-        new TestSessionFactory(notificationHandler, replayObserver, replayGate)
+        new TestSessionFactory(
+          notificationHandler,
+          replayObserver,
+          replayGate,
+          listeningStarted,
+          startSessionHook,
+          closeObserver,
+          closeGate,
+          initResultFailure,
+          acceptFailure,
+          responseStreamFailure
+        )
       )
       provider
     }
@@ -418,7 +716,14 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
   private final class TestSessionFactory(
       notificationHandler: Option[McpTransportContext => IO[Unit]],
       replayObserver: Option[AnyRef => IO[Unit]],
-      replayGate: Option[Mono[Void]]
+      replayGate: Option[Mono[Void]],
+      listeningStarted: Option[IO[Unit]],
+      startSessionHook: Option[String => Unit],
+      closeObserver: Option[() => Unit],
+      closeGate: Option[Mono[Void]],
+      initResultFailure: Option[Throwable],
+      acceptFailure: Option[Throwable],
+      responseStreamFailure: Option[Throwable]
   ) extends McpStreamableServerSession.Factory {
     override def startSession(
         initializeRequest: McpSchema.InitializeRequest
@@ -445,8 +750,14 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
         requestHandlers,
         notificationHandlers,
         replayObserver,
-        replayGate
+        replayGate,
+        listeningStarted,
+        closeObserver,
+        closeGate,
+        acceptFailure,
+        responseStreamFailure
       )
+      startSessionHook.foreach(_(id))
       val result = McpSchema.InitializeResult
         .builder(
           ProtocolVersions.MCP_2025_06_18,
@@ -454,7 +765,10 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
           McpSchema.Implementation.builder("test-server", "1.0").build()
         )
         .build()
-      new McpStreamableServerSession.McpStreamableServerSessionInit(session, Mono.just(result))
+      val initResult = initResultFailure.fold(Mono.just(result))(error =>
+        Mono.error[McpSchema.InitializeResult](error)
+      )
+      new McpStreamableServerSession.McpStreamableServerSessionInit(session, initResult)
     }
   }
 
@@ -465,7 +779,12 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
       requestHandlers: java.util.Map[String, McpRequestHandler[_]],
       notificationHandlers: java.util.Map[String, McpNotificationHandler],
       replayObserver: Option[AnyRef => IO[Unit]],
-      replayGate: Option[Mono[Void]]
+      replayGate: Option[Mono[Void]],
+      listeningStarted: Option[IO[Unit]],
+      closeObserver: Option[() => Unit],
+      closeGate: Option[Mono[Void]],
+      acceptFailure: Option[Throwable],
+      responseStreamFailure: Option[Throwable]
   ) extends McpStreamableServerSession(
         id,
         capabilities,
@@ -475,6 +794,31 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
         notificationHandlers,
         () => Mono.empty[Void]()
       ) {
+    override def listeningStream(transport: McpStreamableServerTransport) = {
+      val stream = super.listeningStream(transport)
+      listeningStarted.foreach(_.unsafeRunAndForget())
+      stream
+    }
+
+    override def accept(notification: McpSchema.JSONRPCNotification): Mono[Void] =
+      acceptFailure.fold(super.accept(notification))(error => Mono.error[Void](error))
+
+    override def responseStream(
+        request: McpSchema.JSONRPCRequest,
+        transport: McpStreamableServerTransport
+    ): Mono[Void] =
+      responseStreamFailure.fold(super.responseStream(request, transport))(error =>
+        Mono.error[Void](error)
+      )
+
+    override def closeGracefully(): Mono[Void] =
+      closeGate.getOrElse(super.closeGracefully())
+
+    override def close(): Unit = {
+      closeObserver.foreach(_())
+      super.close()
+    }
+
     override def replay(lastEventId: Object): Flux[McpSchema.JSONRPCMessage] = {
       replayObserver.foreach(observer => observer(lastEventId).unsafeRunAndForget())
       val messages: Flux[McpSchema.JSONRPCMessage] = Flux.just(

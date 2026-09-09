@@ -1,6 +1,7 @@
 package io.github.http4smcp
 
 import cats.effect.IO
+import cats.effect.kernel.Poll
 import cats.effect.unsafe.IORuntime
 import cats.syntax.all._
 import fs2.Stream
@@ -28,10 +29,12 @@ import org.http4s.Status
 import org.http4s.dsl.io._
 import org.http4s.headers.`Cache-Control`
 import org.http4s.headers.`Content-Type`
+import org.slf4j.LoggerFactory
 import org.typelevel.ci.CIString
 import reactor.core.publisher.Flux
 import reactor.core.publisher.Mono
 
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.ConcurrentHashMap
 import scala.jdk.CollectionConverters._
 
@@ -41,7 +44,9 @@ final class Http4sStreamableServerTransportProvider(
 )(implicit runtime: IORuntime)
     extends McpStreamableServerTransportProvider {
 
-  private val sessions = new ConcurrentHashMap[String, McpStreamableServerSession]()
+  private val logger        = LoggerFactory.getLogger(getClass)
+  private val sessions      = new ConcurrentHashMap[String, McpStreamableServerSession]()
+  private val lifecycleLock = new AnyRef
   @volatile private var sessionFactory: McpStreamableServerSession.Factory = _
   @volatile private var closing: Boolean                                   = false
 
@@ -73,7 +78,12 @@ final class Http4sStreamableServerTransportProvider(
     val sessionsSnapshot = sessions.values().asScala.toList
     Flux
       .fromIterable(sessionsSnapshot.asJava)
-      .flatMap(session => session.sendNotification(method, params).onErrorResume(_ => Mono.empty()))
+      .flatMap { session =>
+        session.sendNotification(method, params).onErrorResume { error =>
+          logger.warn(s"Failed to notify session ${session.getId}", error)
+          Mono.empty()
+        }
+      }
       .`then`()
   }
 
@@ -83,37 +93,48 @@ final class Http4sStreamableServerTransportProvider(
       case None          => Mono.empty()
     }
 
-  override def closeGracefully(): Mono[Void] = {
-    closing = true
-    keepAliveScheduler.foreach(_.shutdown())
-    Flux
-      .fromIterable(sessions.values())
-      .flatMap(session => session.closeGracefully().onErrorResume(_ => Mono.empty()))
-      .`then`(Mono.fromRunnable(() => sessions.clear()))
-  }
+  private val shutdownOperation: Mono[Void] = Mono
+    .defer[Void](() => {
+      val sessionsSnapshot = lifecycleLock.synchronized {
+        closing = true
+        sessions.values().asScala.toList
+      }
+      keepAliveScheduler.foreach(_.shutdown())
+      Flux
+        .fromIterable(sessionsSnapshot.asJava)
+        .flatMap { session =>
+          session.closeGracefully().onErrorResume { error =>
+            logger.warn(s"Failed to close session ${session.getId}", error)
+            Mono.empty[Void]()
+          }
+        }
+        .`then`(Mono.fromRunnable(() => lifecycleLock.synchronized(sessions.clear())))
+    })
+    .cache()
+
+  override def closeGracefully(): Mono[Void] = shutdownOperation
 
   private def handlePost(request: Request[IO]): IO[Response[IO]] =
     if (closing) ServiceUnavailable("Server is shutting down")
-    else {
-      val transportContext = config.contextExtractor.extract(request)
-      for {
-        body     <- request.as[String]
-        parsed   <- IO.blocking(McpSchema.deserializeJsonRpcMessage(jsonMapper, body)).attempt
-        response <- parsed match {
-          case Left(error) =>
-            errorResponse(
-              Status.BadRequest,
-              McpSchema.ErrorCodes.INVALID_REQUEST,
-              s"Invalid message format: ${message(error)}"
-            )
-          case Right(requestMessage: McpSchema.JSONRPCRequest)
-              if requestMessage.method() == McpSchema.METHOD_INITIALIZE =>
-            handleInitialize(request, requestMessage, transportContext)
-          case Right(message) =>
-            handleSessionPost(request, message, transportContext)
-        }
-      } yield response
-    }
+    else
+      readPostBody(request).flatMap {
+        case None       => IO.pure(Response[IO](status = Status.PayloadTooLarge))
+        case Some(body) =>
+          val transportContext = config.contextExtractor.extract(request)
+          IO.blocking(McpSchema.deserializeJsonRpcMessage(jsonMapper, body)).attempt.flatMap {
+            case Left(error) =>
+              errorResponse(
+                Status.BadRequest,
+                McpSchema.ErrorCodes.INVALID_REQUEST,
+                s"Invalid message format: ${message(error)}"
+              )
+            case Right(requestMessage: McpSchema.JSONRPCRequest)
+                if requestMessage.method() == McpSchema.METHOD_INITIALIZE =>
+              handleInitialize(request, requestMessage, transportContext)
+            case Right(message) =>
+              handleSessionPost(request, message, transportContext)
+          }
+      }
 
   private def handleInitialize(
       request: Request[IO],
@@ -133,20 +154,11 @@ final class Http4sStreamableServerTransportProvider(
         initializeRequest <- IO.blocking(
           jsonMapper.convertValue(jsonrpcRequest.params(), initializeRequestType)
         )
-        init       <- IO.blocking(sessionFactory.startSession(initializeRequest))
-        _          <- IO.blocking(sessions.put(init.session().getId, init.session())).void
-        initResult <- ReactorInterop.monoToIO(
-          init.initResult().contextWrite(ctx => ctx.put(McpTransportContext.KEY, transportContext))
-        )
-        // McpJsonMapper is synchronous, so JSON encoding is isolated at the HTTP boundary.
-        body <- IO.blocking(
-          jsonMapper.writeValueAsString(
-            McpSchema.JSONRPCResponse.result(jsonrpcRequest.id(), initResult)
-          )
-        )
-        response <- Ok(body, `Content-Type`(MediaType.application.json)).map(
-          _.putHeaders(Header.Raw(CIString(HttpHeaders.MCP_SESSION_ID), init.session().getId))
-        )
+        response <- IO.uncancelable { poll =>
+          IO.blocking(sessionFactory.startSession(initializeRequest)).flatMap { init =>
+            completeInitialization(init, jsonrpcRequest, transportContext, poll)
+          }
+        }
       } yield response
     }
 
@@ -166,7 +178,15 @@ final class Http4sStreamableServerTransportProvider(
                   .accept(response)
                   .contextWrite(ctx => ctx.put(McpTransportContext.KEY, transportContext))
               )
-              .attempt *> Accepted()
+              .attempt
+              .flatMap {
+                case Left(error) =>
+                  IO(
+                    logger
+                      .error(s"Failed to accept JSON-RPC response for session $sessionId", error)
+                  )
+                case Right(_) => IO.unit
+              } *> Accepted()
           case notification: McpSchema.JSONRPCNotification =>
             ReactorInterop
               .monoToIO(
@@ -174,7 +194,17 @@ final class Http4sStreamableServerTransportProvider(
                   .accept(notification)
                   .contextWrite(ctx => ctx.put(McpTransportContext.KEY, transportContext))
               )
-              .attempt *> Accepted()
+              .attempt
+              .flatMap {
+                case Left(error) =>
+                  IO(
+                    logger.error(
+                      s"Failed to accept JSON-RPC notification for session $sessionId",
+                      error
+                    )
+                  )
+                case Right(_) => IO.unit
+              } *> Accepted()
           case rpcRequest: McpSchema.JSONRPCRequest =>
             for {
               transport <- Http4sStreamableServerTransport.create(sessionId, jsonMapper)
@@ -184,8 +214,12 @@ final class Http4sStreamableServerTransportProvider(
                     .responseStream(rpcRequest, transport)
                     .contextWrite(ctx => ctx.put(McpTransportContext.KEY, transportContext))
                 )
-                .attempt
-                .void
+                .handleErrorWith { error =>
+                  IO(
+                    logger.error(s"Failed to process response stream for session $sessionId", error)
+                  )
+                }
+                .guarantee(closeResponseTransport(sessionId, transport))
                 .start
               response <- sseResponse(transport.events.onFinalize(fiber.cancel))
             } yield response
@@ -298,6 +332,87 @@ final class Http4sStreamableServerTransportProvider(
     }
   }
 
+  private def readPostBody(request: Request[IO]): IO[Option[String]] =
+    if (request.contentLength.exists(_ > Http4sStreamableServerTransportProvider.RequestMaxBytes))
+      IO.pure(None)
+    else
+      request.body
+        .take(Http4sStreamableServerTransportProvider.RequestMaxBytes + 1)
+        .compile
+        .to(Array)
+        .map { bytes =>
+          Option.when(bytes.length <= Http4sStreamableServerTransportProvider.RequestMaxBytes)(
+            new String(bytes, StandardCharsets.UTF_8)
+          )
+        }
+
+  private def completeInitialization(
+      init: McpStreamableServerSession.McpStreamableServerSessionInit,
+      jsonrpcRequest: McpSchema.JSONRPCRequest,
+      transportContext: McpTransportContext,
+      poll: Poll[IO]
+  ): IO[Response[IO]] = {
+    val session  = init.session()
+    val complete = for {
+      initResult <- ReactorInterop.monoToIO(
+        init.initResult().contextWrite(ctx => ctx.put(McpTransportContext.KEY, transportContext))
+      )
+      // McpJsonMapper is synchronous, so JSON encoding is isolated at the HTTP boundary.
+      body <- IO.blocking(
+        jsonMapper.writeValueAsString(
+          McpSchema.JSONRPCResponse.result(jsonrpcRequest.id(), initResult)
+        )
+      )
+      registered <- registerSession(session)
+      response   <-
+        if (registered)
+          Ok(body, `Content-Type`(MediaType.application.json)).map(
+            _.putHeaders(Header.Raw(CIString(HttpHeaders.MCP_SESSION_ID), session.getId))
+          )
+        else
+          closeSession(session, "created after shutdown began") *>
+            ServiceUnavailable("Server is shutting down")
+    } yield response
+
+    poll(complete)
+      .onError { case error =>
+        IO(logger.error(s"Failed to initialize session ${session.getId}", error)) *>
+          discardSession(session, "initialization failed")
+      }
+      .onCancel(discardSession(session, "initialization was canceled"))
+  }
+
+  private def registerSession(session: McpStreamableServerSession): IO[Boolean] =
+    IO {
+      lifecycleLock.synchronized {
+        if (closing) false
+        else {
+          sessions.put(session.getId, session)
+          true
+        }
+      }
+    }
+
+  private def discardSession(
+      session: McpStreamableServerSession,
+      reason: String
+  ): IO[Unit] =
+    IO(lifecycleLock.synchronized(sessions.remove(session.getId, session))).void *>
+      closeSession(session, reason)
+
+  private def closeSession(session: McpStreamableServerSession, reason: String): IO[Unit] =
+    IO(session.close()).handleErrorWith { error =>
+      IO(logger.warn(s"Failed to close session ${session.getId} after $reason", error))
+    }
+
+  private def closeResponseTransport(
+      sessionId: String,
+      transport: Http4sStreamableServerTransport
+  ): IO[Unit] =
+    ReactorInterop.monoToIO(transport.closeGracefully()).void.handleErrorWith { error =>
+      IO(logger.warn(s"Failed to close response transport for session $sessionId", error))
+    }
+
   private def badPostAcceptResponse: IO[Response[IO]] =
     errorResponse(
       Status.BadRequest,
@@ -350,6 +465,8 @@ final class Http4sStreamableServerTransportProvider(
 }
 
 object Http4sStreamableServerTransportProvider {
+  private val RequestMaxBytes = 16L * 1024 * 1024
+
   def apply(
       jsonMapper: McpJsonMapper = McpJsonDefaults.getMapper,
       config: Http4sStreamableServerTransportProviderConfig =
@@ -357,6 +474,10 @@ object Http4sStreamableServerTransportProvider {
   )(implicit runtime: IORuntime): Http4sStreamableServerTransportProvider =
     new Http4sStreamableServerTransportProvider(jsonMapper, config)
 
+  @deprecated(
+    "Use Http4sStreamableServerTransportProvider(...).routes to retain provider lifecycle access",
+    "0.1.1"
+  )
   def routes(
       jsonMapper: McpJsonMapper = McpJsonDefaults.getMapper,
       config: Http4sStreamableServerTransportProviderConfig =

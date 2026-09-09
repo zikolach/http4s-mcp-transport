@@ -2,9 +2,10 @@ package io.github.http4smcp
 
 import cats.effect.IO
 import cats.effect.Ref
+import cats.effect.std.Queue
+import cats.effect.std.Semaphore
 import cats.effect.unsafe.IORuntime
 import fs2.Stream
-import cats.effect.std.Queue
 import io.github.http4smcp.internal.ReactorInterop
 import io.modelcontextprotocol.json.McpJsonMapper
 import io.modelcontextprotocol.json.TypeRef
@@ -18,7 +19,8 @@ private[http4smcp] final class Http4sStreamableServerTransport private (
     sessionId: String,
     jsonMapper: McpJsonMapper,
     queue: Queue[IO, Option[ServerSentEvent]],
-    closed: Ref[IO, Boolean]
+    closed: Ref[IO, Boolean],
+    operationLock: Semaphore[IO]
 )(implicit runtime: IORuntime)
     extends McpStreamableServerTransport {
 
@@ -33,13 +35,17 @@ private[http4smcp] final class Http4sStreamableServerTransport private (
 
   override def sendMessage(message: McpSchema.JSONRPCMessage, messageId: String): Mono[Void] =
     ReactorInterop.ioUnitToMono {
-      closed.get.flatMap {
-        case true  => IO.unit
-        case false =>
-          IO(jsonMapper.writeValueAsString(message)).flatMap { json =>
-            val eventId = Option(messageId).getOrElse(sessionId)
-            queue.offer(Some(ServerSentEvent(Some(json), Some("message"), Some(EventId(eventId)))))
-          }
+      operationLock.permit.use { _ =>
+        closed.get.flatMap {
+          case true  => IO.unit
+          case false =>
+            IO(jsonMapper.writeValueAsString(message)).flatMap { json =>
+              val eventId = Option(messageId).getOrElse(sessionId)
+              queue.offer(
+                Some(ServerSentEvent(Some(json), Some("message"), Some(EventId(eventId))))
+              )
+            }
+        }
       }
     }
 
@@ -53,10 +59,12 @@ private[http4smcp] final class Http4sStreamableServerTransport private (
     closeIO.unsafeRunAndForget()
 
   private def closeIO: IO[Unit] =
-    closed.modify {
-      case true  => true -> IO.unit
-      case false => true -> queue.offer(None)
-    }.flatten
+    operationLock.permit.use { _ =>
+      closed.modify {
+        case true  => true -> IO.unit
+        case false => true -> queue.offer(None)
+      }.flatten
+    }
 }
 
 private[http4smcp] object Http4sStreamableServerTransport {
@@ -64,7 +72,14 @@ private[http4smcp] object Http4sStreamableServerTransport {
       runtime: IORuntime
   ): IO[Http4sStreamableServerTransport] =
     for {
-      queue  <- Queue.unbounded[IO, Option[ServerSentEvent]]
-      closed <- Ref.of[IO, Boolean](false)
-    } yield new Http4sStreamableServerTransport(sessionId, jsonMapper, queue, closed)
+      queue         <- Queue.unbounded[IO, Option[ServerSentEvent]]
+      closed        <- Ref.of[IO, Boolean](false)
+      operationLock <- Semaphore[IO](1)
+    } yield new Http4sStreamableServerTransport(
+      sessionId,
+      jsonMapper,
+      queue,
+      closed,
+      operationLock
+    )
 }
