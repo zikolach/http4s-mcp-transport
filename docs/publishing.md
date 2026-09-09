@@ -8,7 +8,7 @@ The sbt build derives the package version from:
 
 1. `HTTP4S_MCP_TRANSPORT_VERSION`, when set;
 2. tag names like `v0.1.0`, via `GITHUB_REF_NAME`;
-3. `0.1.0-SNAPSHOT` for local builds.
+3. `0.1.1-SNAPSHOT` for local builds.
 
 Published Scala coordinates use `%%` in sbt:
 

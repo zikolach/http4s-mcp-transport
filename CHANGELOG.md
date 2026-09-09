@@ -7,6 +7,16 @@ and this project uses semantic versioning while it remains pre-1.0.
 
 ## [Unreleased]
 
+### Changed
+
+- Updated the MCP Java SDK to 2.0.1 for transport correctness fixes and bounded HTTP reads.
+- Updated Scala 3 LTS, Cats Effect, FS2, Reactor Core, SLF4J, and test dependencies.
+- Updated sbt, Scalafmt, publishing plugins, and GitHub Actions.
+
+### Security
+
+- Updated http4s to 0.23.37 to include upstream denial-of-service fixes for Ember HTTP/2 and WebSocket handling.
+
 ## [0.1.0] - 2026-07-01
 
 ### Added
