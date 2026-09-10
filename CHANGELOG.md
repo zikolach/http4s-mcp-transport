@@ -7,13 +7,17 @@ and this project uses semantic versioning while it remains pre-1.0.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-10
+
 ### Changed
 
-- Added finite request, outbound buffer, session admission, and idle expiry limits with configurable defaults.
+- Changed the provider configuration constructor. Existing integrations must recompile for 0.2.0.
+- Removed the deprecated `Http4sStreamableServerTransportProvider.routes` companion helper. Applications must retain the provider and mount `provider.routes`.
+- Added configurable limits with defaults of 16 MiB per request, 256 queued events per stream, 1,024 sessions per provider, and 30 minutes of idle time.
 - Added request-header security validation and structured `Accept` negotiation.
 - Added demand-aware Reactor streaming and typed value and completion `Mono` conversions.
 - Made DELETE, idle expiry, and shutdown share provider-owned response cleanup.
-- Removed the deprecated `Http4sStreamableServerTransportProvider.routes` companion helper. Applications must retain the provider and mount `provider.routes`.
+- Made sends fail when their transport closes before event admission, and kept expiry sweeps independent of slow session cleanup.
 
 ### Security
 
@@ -45,6 +49,7 @@ and this project uses semantic versioning while it remains pre-1.0.
 - Added Scalafmt, GitHub Actions CI, and Maven Central publishing configuration.
 - Added release automation for GitHub Releases with Maven Central coordinates.
 
-[Unreleased]: https://github.com/zikolach/http4s-mcp-transport/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/zikolach/http4s-mcp-transport/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/zikolach/http4s-mcp-transport/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/zikolach/http4s-mcp-transport/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/zikolach/http4s-mcp-transport/releases/tag/v0.1.0
