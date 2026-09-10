@@ -110,11 +110,15 @@ Alternatives considered:
 - Keep the send-close semaphore around a bounded queue. Rejected because a blocked send could hold the semaphore and prevent close.
 - Use an unbounded queue with monitoring. Rejected because monitoring does not enforce a resource bound.
 
-### Use the FS2 Reactive Streams bridge for Reactor publishers
+### Use the FS2 Flow bridge for Reactor publishers
 
-Add `fs2-reactive-streams` at the same version as `fs2-core` and convert Reactor `Flux` values through its demand-aware publisher bridge. Downstream FS2 cancellation must cancel the Reactor subscription. Remove callback subscriptions that call `unsafeRunAndForget` for every signal.
+Q4 is resolved with O4-1. Convert Reactor `Flux` values with `reactor.adapter.JdkFlowAdapter.publisherToFlowPublisher` and consume them through `Stream.fromPublisher` from `fs2-core`, using a chunk size of one. This uses FS2's Flow implementation without adding a dependency or changing dependency versions. Downstream FS2 cancellation must cancel the Reactor subscription. Remove callback subscriptions that call `unsafeRunAndForget` for every signal.
 
-A custom Reactive Streams subscriber is rejected because the standard FS2 integration already owns demand, terminal signals, and cancellation.
+The originally planned `fs2-reactive-streams` 3.14.0 bridge failed a cancellation probe after a stalled publisher received demand. The Flow bridge passed the cancellation, bounded-demand, early-completion, empty-completion, ordering, and error-propagation probes on both Scala versions. Record the commands and findings in `sdk-2.0.1-evidence.md`.
+
+Carry upstream errors as `Either` values through the bridge and rethrow them in FS2. The Flow implementation can otherwise wrap an early publisher error in a private exception. This preserves the original throwable without reflection or matching private library types. Failure is observed on downstream pull, like other stream elements.
+
+A custom subscriber is rejected because the standard FS2 and Reactor integrations already own demand, terminal signals, and cancellation.
 
 ### Validate security headers before request processing
 
@@ -142,7 +146,7 @@ Remove `Http4sStreamableServerTransportProvider.routes`. Applications must retai
 - A count-based capacity does not bound the size of one serialized event. The transport bounds queue cardinality; outbound message-size policy remains application-owned.
 - Structured `Accept` matching admits valid wildcard ranges that the previous substring check rejected. Protocol tests will make this behavior explicit.
 - Security validation is opt-in by default. Documentation must show how internet-facing applications enable the SDK validator.
-- Adding `fs2-reactive-streams` increases the published dependency set. Keeping its version aligned with FS2 avoids version skew.
+- The Flow bridge uses existing FS2 and Reactor dependencies. Tests must retain the demand-established cancellation schedule; subscription alone does not prove the consumer has begun waiting for upstream data.
 - Finite defaults can reject initialization or expire clients that previously retained sessions indefinitely. Migration notes must describe client reinitialization after HTTP 404 and capacity rejection with HTTP 503.
 - Active work delays idle expiry. Session caps and expiry do not bound stream count, stalled application work, or per-session memory.
 - SDK shutdown is not proof that every provider response has stopped. Acceptance must observe owned workers, streams, and finalizers directly.

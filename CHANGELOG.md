@@ -7,6 +7,18 @@ and this project uses semantic versioning while it remains pre-1.0.
 
 ## [Unreleased]
 
+### Changed
+
+- Added finite request, outbound buffer, session admission, and idle expiry limits with configurable defaults.
+- Added request-header security validation and structured `Accept` negotiation.
+- Added demand-aware Reactor streaming and typed value and completion `Mono` conversions.
+- Made DELETE, idle expiry, and shutdown share provider-owned response cleanup.
+- Removed the deprecated `Http4sStreamableServerTransportProvider.routes` companion helper. Applications must retain the provider and mount `provider.routes`.
+
+### Security
+
+- Replaced transport-owned exception diagnostics with fixed operation and failure codes that omit client-controlled data and throwable details.
+
 ## [0.1.1] - 2026-09-09
 
 ### Changed

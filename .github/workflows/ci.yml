@@ -21,4 +21,4 @@ jobs:
           java-version: '17'
       - uses: sbt/setup-sbt@v1
       - name: Validate
-        run: sbt "scalafmtCheckAll; +compile; +transport / Test / testOnly io.github.http4smcp.Http4sStreamableServerTransportProviderSuite; simpleServer/compile"
+        run: sbt "scalafmtCheckAll; +compile; +transport/Test/test; simpleServer/compile"

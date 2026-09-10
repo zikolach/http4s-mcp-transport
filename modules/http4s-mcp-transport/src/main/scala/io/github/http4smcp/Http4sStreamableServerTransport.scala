@@ -1,11 +1,10 @@
 package io.github.http4smcp
 
 import cats.effect.IO
-import cats.effect.Ref
-import cats.effect.std.Queue
-import cats.effect.std.Semaphore
 import cats.effect.unsafe.IORuntime
+import cats.syntax.all._
 import fs2.Stream
+import fs2.concurrent.Channel
 import io.github.http4smcp.internal.ReactorInterop
 import io.modelcontextprotocol.json.McpJsonMapper
 import io.modelcontextprotocol.json.TypeRef
@@ -18,33 +17,25 @@ import reactor.core.publisher.Mono
 private[http4smcp] final class Http4sStreamableServerTransport private (
     sessionId: String,
     jsonMapper: McpJsonMapper,
-    queue: Queue[IO, Option[ServerSentEvent]],
-    closed: Ref[IO, Boolean],
-    operationLock: Semaphore[IO]
+    channel: Channel[IO, ServerSentEvent]
 )(implicit runtime: IORuntime)
     extends McpStreamableServerTransport {
 
-  val events: Stream[IO, ServerSentEvent] =
-    Stream
-      .repeatEval(queue.take)
-      .unNoneTerminate
-      .onFinalize(closeIO)
+  val events: Stream[IO, ServerSentEvent] = channel.stream.onFinalize(closeIO)
 
   override def sendMessage(message: McpSchema.JSONRPCMessage): Mono[Void] =
     sendMessage(message, null)
 
   override def sendMessage(message: McpSchema.JSONRPCMessage, messageId: String): Mono[Void] =
     ReactorInterop.ioUnitToMono {
-      operationLock.permit.use { _ =>
-        closed.get.flatMap {
-          case true  => IO.unit
-          case false =>
-            IO(jsonMapper.writeValueAsString(message)).flatMap { json =>
-              val eventId = Option(messageId).getOrElse(sessionId)
-              queue.offer(
-                Some(ServerSentEvent(Some(json), Some("message"), Some(EventId(eventId))))
-              )
-            }
+      IO(jsonMapper.writeValueAsString(message)).flatMap { json =>
+        val eventId = Option(messageId).getOrElse(sessionId)
+        IO.race(
+          channel.send(ServerSentEvent(Some(json), Some("message"), Some(EventId(eventId)))),
+          channel.closed
+        ).flatMap {
+          case Left(Right(_)) => IO.unit
+          case _              => IO.raiseError(new IllegalStateException("MCP_TRANSPORT_CLOSED"))
         }
       }
     }
@@ -58,28 +49,14 @@ private[http4smcp] final class Http4sStreamableServerTransport private (
   override def close(): Unit =
     closeIO.unsafeRunAndForget()
 
-  private def closeIO: IO[Unit] =
-    operationLock.permit.use { _ =>
-      closed.modify {
-        case true  => true -> IO.unit
-        case false => true -> queue.offer(None)
-      }.flatten
-    }
+  private[http4smcp] def closeIO: IO[Unit] = channel.close.void
 }
 
 private[http4smcp] object Http4sStreamableServerTransport {
-  def create(sessionId: String, jsonMapper: McpJsonMapper)(implicit
+  def create(sessionId: String, jsonMapper: McpJsonMapper, capacity: Int = 256)(implicit
       runtime: IORuntime
   ): IO[Http4sStreamableServerTransport] =
-    for {
-      queue         <- Queue.unbounded[IO, Option[ServerSentEvent]]
-      closed        <- Ref.of[IO, Boolean](false)
-      operationLock <- Semaphore[IO](1)
-    } yield new Http4sStreamableServerTransport(
-      sessionId,
-      jsonMapper,
-      queue,
-      closed,
-      operationLock
-    )
+    Channel
+      .bounded[IO, ServerSentEvent](capacity)
+      .map(new Http4sStreamableServerTransport(sessionId, jsonMapper, _))
 }

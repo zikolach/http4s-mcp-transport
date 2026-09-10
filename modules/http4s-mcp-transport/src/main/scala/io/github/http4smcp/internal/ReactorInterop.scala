@@ -1,9 +1,9 @@
 package io.github.http4smcp.internal
 
 import cats.effect.IO
-import cats.effect.std.Queue
 import cats.effect.unsafe.IORuntime
 import fs2.Stream
+import reactor.adapter.JdkFlowAdapter
 import reactor.core.Disposable
 import reactor.core.publisher.Flux
 import reactor.core.publisher.Mono
@@ -23,7 +23,24 @@ private[http4smcp] object ReactorInterop {
         val disposable = mono.subscribe(
           value => if (completed.compareAndSet(false, true)) callback(Right(value)),
           error => if (completed.compareAndSet(false, true)) callback(Left(error)),
-          () => if (completed.compareAndSet(false, true)) callback(Right(null.asInstanceOf[A]))
+          () =>
+            if (completed.compareAndSet(false, true))
+              callback(Left(new NoSuchElementException("Mono completed without a value")))
+        )
+        Some(IO {
+          if (completed.compareAndSet(false, true)) disposable.dispose()
+        })
+      }
+    }
+
+  def monoCompletionToIO(mono: Mono[_]): IO[Unit] =
+    IO.async[Unit] { callback =>
+      IO {
+        val completed  = new AtomicBoolean(false)
+        val disposable = mono.subscribe(
+          _ => (),
+          error => if (completed.compareAndSet(false, true)) callback(Left(error)),
+          () => if (completed.compareAndSet(false, true)) callback(Right(()))
         )
         Some(IO {
           if (completed.compareAndSet(false, true)) disposable.dispose()
@@ -53,28 +70,11 @@ private[http4smcp] object ReactorInterop {
       ()
     }
 
-  def fluxToStream[A](flux: Flux[A])(implicit runtime: IORuntime): Stream[IO, A] =
-    Stream
-      .eval(Queue.unbounded[IO, Option[Either[Throwable, A]]])
-      .flatMap { queue =>
-        Stream
-          .bracket {
-            IO {
-              flux.subscribe(
-                value => queue.offer(Some(Right(value))).unsafeRunAndForget(),
-                error => queue.offer(Some(Left(error))).unsafeRunAndForget(),
-                () => queue.offer(None).unsafeRunAndForget()
-              )
-            }
-          } { (disposable: Disposable) => IO(disposable.dispose()) }
-          .flatMap { _ =>
-            Stream
-              .repeatEval(queue.take)
-              .unNoneTerminate
-              .flatMap {
-                case Right(value) => Stream.emit(value)
-                case Left(error)  => Stream.raiseError[IO](error)
-              }
-          }
-      }
+  def fluxToStream[A](flux: Flux[A]): Stream[IO, A] = {
+    // Carry upstream errors as values so the Flow bridge cannot replace the original throwable.
+    val values = flux
+      .map[Either[Throwable, A]](value => Right(value))
+      .onErrorResume(error => Flux.just[Either[Throwable, A]](Left(error)))
+    Stream.fromPublisher[IO](JdkFlowAdapter.publisherToFlowPublisher(values), chunkSize = 1).rethrow
+  }
 }

@@ -5,7 +5,7 @@ The transport currently has no configurable resource limits or SDK header valida
 ## What Changes
 
 - Add configurable POST request and outbound stream limits with safe defaults.
-- Make Reactor-to-FS2 streaming demand-aware and prevent unbounded buffering.
+- Make Reactor-to-FS2 streaming demand-aware through the standard Flow bridge and prevent unbounded buffering.
 - Enable configurable limits of 1,024 sessions per provider and 30 minutes of idle time by default, including capacity reservations for initialization.
 - Own every provider-created response worker, SSE transport, GET listener handle, and replay subscription through disconnect and session termination.
 - Make transport-owned diagnostic logs payload-free without changing application logging configuration.
@@ -35,4 +35,4 @@ None.
 - Changes diagnostics by removing original exceptions and raw identifiers from transport-owned logs.
 - Requires SDK feasibility checks before implementing the new session lifecycle work.
 - Affects the provider, per-stream transport, Reactor interop, tests, README, migration notes, and published API compatibility.
-- May add the FS2 Reactive Streams integration module if it provides the required demand propagation without a custom subscriber.
+- Uses the Flow bridge in `fs2-core` with Reactor's `JdkFlowAdapter`; no additional streaming dependency is required.

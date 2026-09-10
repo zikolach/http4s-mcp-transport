@@ -32,7 +32,7 @@ def releaseVersion: String =
     .get("HTTP4S_MCP_TRANSPORT_VERSION")
     .filter(_.nonEmpty)
     .orElse(sys.env.get("GITHUB_REF_NAME").filter(_.startsWith("v")).map(_.stripPrefix("v")))
-    .getOrElse("0.1.1-SNAPSHOT")
+    .getOrElse("0.2.0-SNAPSHOT")
 
 val mcpVersion = "2.0.1"
 val http4sVersion = "0.23.37"
