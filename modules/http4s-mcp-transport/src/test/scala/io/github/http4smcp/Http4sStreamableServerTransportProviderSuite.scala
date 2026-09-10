@@ -880,15 +880,20 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
         startSessionHook = Some { _ =>
           starts.incrementAndGet()
           started.countDown()
-          assert(release.await(2, TimeUnit.SECONDS))
+          release.await()
         },
         config = Http4sStreamableServerTransportProviderConfig(maxSessions = 1)
       )
       pending <- provider.routes.orNotFound.run(post(initializeJson)).start
-      _       <- IO.blocking(assert(started.await(2, TimeUnit.SECONDS)))
-      full    <- provider.routes.orNotFound.run(post(initializeJson))
-      _       <- IO(release.countDown())
-      _       <- pending.joinWithNever.timeout(2.seconds)
+      full    <- (for {
+        _    <- IO.blocking(assert(started.await(2, TimeUnit.SECONDS)))
+        full <- provider.routes.orNotFound.run(post(initializeJson))
+        _    <- IO(release.countDown())
+        _    <- pending.joinWithNever.timeout(2.seconds)
+      } yield full).guarantee(
+        IO(release.countDown()) *> pending.cancel *>
+          ReactorInterop.monoCompletionToIO(provider.closeGracefully())
+      )
     } yield {
       assertEquals(full.status, Status.ServiceUnavailable)
       assertEquals(starts.get(), 1)
