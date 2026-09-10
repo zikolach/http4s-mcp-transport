@@ -131,3 +131,9 @@ HTTP4S_MCP_TRANSPORT_VERSION=0.2.0 sbt 'show version; +publishLocal'
 Both artifact variants were published locally at `0.2.0`. `scalafmtCheckAll` passed after the repairs. No tag or remote publication is part of this acceptance evidence. The documented SDK and response-error disclosure limits remain unchanged.
 
 Hosted CI run `34450726150` passed all 70 tests on each Scala version for implementation commit `2fdef8f`. The subsequent changelog-only run reused sbt's incremental test results. CI and release validation now use `+transport/Test/testOnly *` to execute every transport suite explicitly, including SDK probes, instead of relying on `test` and its incremental selection.
+
+## Release validation synchronization repair
+
+Release run `34451807835` failed before publication because the unconsumed-GET test attempted capacity reuse immediately after a nonblocking expiry sweep. It received HTTP 503 while cleanup still held the reservation. Under Q5, O5-1, the user approved repairing the test synchronization and moving the unpublished `v0.2.0` tag after validation.
+
+The three expiry tests that assert capacity reuse now await an explicit `afterTermination` signal before initializing another session. Production code and assertions are unchanged. The full suites passed 70 tests per Scala version. The three affected tests also passed five consecutive focused runs on each Scala version. Formatting and library/example compilation passed.

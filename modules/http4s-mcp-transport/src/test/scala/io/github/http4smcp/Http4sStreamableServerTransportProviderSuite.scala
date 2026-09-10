@@ -901,11 +901,13 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
       sessionIdleTimeout = Duration.ofNanos(10)
     )
     for {
-      clock    <- Ref.of[IO, Long](0L)
-      provider <- testProvider(config = config)
-      _        <- IO(
+      clock      <- Ref.of[IO, Long](0L)
+      terminated <- Deferred[IO, Unit]
+      provider   <- testProvider(config = config)
+      _          <- IO(
         Http4sStreamableServerTransportProvider.installTestHooks(
           provider,
+          afterTermination = terminated.complete(()).void,
           monotonicNanos = Some(clock.get)
         )
       )
@@ -915,6 +917,7 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
       _         <- clock.set(19L)
       _         <- Http4sStreamableServerTransportProvider.runExpirySweep(provider)
       expired   <- provider.routes.orNotFound.run(post(notificationJson, Some(sessionId)))
+      _         <- terminated.get.timeout(2.seconds)
       admitted  <- provider.routes.orNotFound.run(post(initializeJson))
     } yield {
       assertEquals(before.status, Status.Accepted)
@@ -1333,7 +1336,8 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
   test("unconsumed GET bodies stay lazy across DELETE, expiry, and shutdown") {
     def responseWithSignals(
         config: Http4sStreamableServerTransportProviderConfig,
-        clock: Option[Ref[IO, Long]] = None
+        clock: Option[Ref[IO, Long]] = None,
+        afterTermination: IO[Unit] = IO.unit
     ): IO[
       (
           Http4sStreamableServerTransportProvider,
@@ -1354,6 +1358,7 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
         _ <- IO(
           Http4sStreamableServerTransportProvider.installTestHooks(
             provider,
+            afterTermination = afterTermination,
             monotonicNanos = clock.map(_.get)
           )
         )
@@ -1368,24 +1373,30 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
       sessionIdleTimeout = Duration.ofNanos(10)
     )
     for {
-      deleteCase     <- responseWithSignals(Http4sStreamableServerTransportProviderConfig())
-      _              <- deleteCase._1.routes.orNotFound.run(delete(Some(deleteCase._2)))
-      _              <- deleteCase._3.body.compile.drain.timeout(2.seconds)
-      deleteReplay   <- deleteCase._4.tryGet
-      deleteListen   <- deleteCase._5.tryGet
-      shutdownCase   <- responseWithSignals(Http4sStreamableServerTransportProviderConfig())
-      _              <- ReactorInterop.monoCompletionToIO(shutdownCase._1.closeGracefully())
-      _              <- shutdownCase._3.body.compile.drain.timeout(2.seconds)
-      shutdownReplay <- shutdownCase._4.tryGet
-      shutdownListen <- shutdownCase._5.tryGet
-      expiryClock    <- Ref.of[IO, Long](0L)
-      expiryCase     <- responseWithSignals(expiryConfig, Some(expiryClock))
-      _              <- expiryClock.set(10L)
-      _              <- Http4sStreamableServerTransportProvider.runExpirySweep(expiryCase._1)
-      admitted       <- expiryCase._1.routes.orNotFound.run(post(initializeJson))
-      _              <- expiryCase._3.body.compile.drain.timeout(2.seconds)
-      expiryReplay   <- expiryCase._4.tryGet
-      expiryListen   <- expiryCase._5.tryGet
+      deleteCase       <- responseWithSignals(Http4sStreamableServerTransportProviderConfig())
+      _                <- deleteCase._1.routes.orNotFound.run(delete(Some(deleteCase._2)))
+      _                <- deleteCase._3.body.compile.drain.timeout(2.seconds)
+      deleteReplay     <- deleteCase._4.tryGet
+      deleteListen     <- deleteCase._5.tryGet
+      shutdownCase     <- responseWithSignals(Http4sStreamableServerTransportProviderConfig())
+      _                <- ReactorInterop.monoCompletionToIO(shutdownCase._1.closeGracefully())
+      _                <- shutdownCase._3.body.compile.drain.timeout(2.seconds)
+      shutdownReplay   <- shutdownCase._4.tryGet
+      shutdownListen   <- shutdownCase._5.tryGet
+      expiryClock      <- Ref.of[IO, Long](0L)
+      expiryTerminated <- Deferred[IO, Unit]
+      expiryCase       <- responseWithSignals(
+        expiryConfig,
+        Some(expiryClock),
+        expiryTerminated.complete(()).void
+      )
+      _            <- expiryClock.set(10L)
+      _            <- Http4sStreamableServerTransportProvider.runExpirySweep(expiryCase._1)
+      _            <- expiryTerminated.get.timeout(2.seconds)
+      admitted     <- expiryCase._1.routes.orNotFound.run(post(initializeJson))
+      _            <- expiryCase._3.body.compile.drain.timeout(2.seconds)
+      expiryReplay <- expiryCase._4.tryGet
+      expiryListen <- expiryCase._5.tryGet
     } yield {
       assertEquals(deleteReplay, None)
       assertEquals(deleteListen, None)
@@ -1404,9 +1415,10 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
       sessionIdleTimeout = Duration.ofNanos(10)
     )
     for {
-      clock    <- Ref.of[IO, Long](0L)
-      started  <- Deferred[IO, Unit]
-      provider <- testProvider(
+      clock      <- Ref.of[IO, Long](0L)
+      started    <- Deferred[IO, Unit]
+      terminated <- Deferred[IO, Unit]
+      provider   <- testProvider(
         responseStreamOverride = Some(_ =>
           gate.asMono().doOnSubscribe(_ => started.complete(()).void.unsafeRunAndForget())
         ),
@@ -1415,6 +1427,7 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
       _ <- IO(
         Http4sStreamableServerTransportProvider.installTestHooks(
           provider,
+          afterTermination = terminated.complete(()).void,
           monotonicNanos = Some(clock.get)
         )
       )
@@ -1432,6 +1445,7 @@ final class Http4sStreamableServerTransportProviderSuite extends CatsEffectSuite
       stillFull <- provider.routes.orNotFound.run(post(initializeJson))
       _         <- clock.set(20L)
       _         <- Http4sStreamableServerTransportProvider.runExpirySweep(provider)
+      _         <- terminated.get.timeout(2.seconds)
       admitted  <- provider.routes.orNotFound.run(post(initializeJson))
     } yield {
       assertEquals(active.status, Status.Accepted)
