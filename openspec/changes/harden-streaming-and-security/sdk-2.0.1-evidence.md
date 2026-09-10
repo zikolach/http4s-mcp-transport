@@ -129,3 +129,5 @@ HTTP4S_MCP_TRANSPORT_VERSION=0.2.0 sbt 'show version; +publishLocal'
 ```
 
 Both artifact variants were published locally at `0.2.0`. `scalafmtCheckAll` passed after the repairs. No tag or remote publication is part of this acceptance evidence. The documented SDK and response-error disclosure limits remain unchanged.
+
+Hosted CI run `34450726150` passed all 70 tests on each Scala version for implementation commit `2fdef8f`. The subsequent changelog-only run reused sbt's incremental test results. CI and release validation now use `+transport/Test/testOnly *` to execute every transport suite explicitly, including SDK probes, instead of relying on `test` and its incremental selection.

@@ -51,7 +51,7 @@ jobs:
             ${{ runner.os }}-sbt-
 
       - name: Validate build
-        run: sbt "scalafmtCheckAll; +compile; +transport/Test/test; simpleServer/compile"
+        run: sbt "scalafmtCheckAll; +compile; +transport/Test/testOnly *; simpleServer/compile"
 
       - name: Stop validation sbt server
         run: sbt --client shutdown || true
